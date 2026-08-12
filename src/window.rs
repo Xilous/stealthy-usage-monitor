@@ -1447,6 +1447,15 @@ pub fn run() {
         // the widget would never get positioned.
         if attach_to_taskbar(hwnd, settings.taskbar_index, settings.embed_in_taskbar) {
             embedded = settings.embed_in_taskbar;
+        } else {
+            // No taskbar existed yet - the usual cause is launching during
+            // login before explorer has created the shell. attach runs once
+            // here and the watchdog only recovers a taskbar that changes after
+            // a successful attach, so without a retry the widget would stay
+            // pinned to its (0,0) creation spot for the whole session. Poll
+            // for the taskbar and attach + position once it appears.
+            SetTimer(hwnd, native_interop::TIMER_TASKBAR_RETRY, 1_000, None);
+            diagnose::log("taskbar not ready at startup; scheduling attach retries");
         }
 
         // If not embedded, fall back to topmost popup with SetLayeredWindowAttributes
@@ -2506,6 +2515,27 @@ unsafe extern "system" fn wnd_proc(
                     };
                     if let Some(h) = target {
                         native_interop::reassert_topmost(h);
+                    }
+                }
+                native_interop::TIMER_TASKBAR_RETRY => {
+                    // The shell had no taskbar when we started. Keep trying to
+                    // attach until it appears, then position against it and stop
+                    // retrying. Reads the saved index/embed preference back from
+                    // state so a retry behaves exactly like the startup attach.
+                    let (index, embed, attached) = {
+                        let state = lock_state();
+                        match state.as_ref() {
+                            Some(s) => {
+                                (s.taskbar_index, s.embed_in_taskbar, s.taskbar_hwnd.is_some())
+                            }
+                            None => (0, default_embed_in_taskbar(), false),
+                        }
+                    };
+                    if attached || attach_to_taskbar(hwnd, index, embed) {
+                        let _ = KillTimer(hwnd, native_interop::TIMER_TASKBAR_RETRY);
+                        diagnose::log("taskbar retry: attached, positioning widget");
+                        position_at_taskbar();
+                        render_layered();
                     }
                 }
                 _ => {}
