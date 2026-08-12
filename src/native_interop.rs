@@ -23,6 +23,13 @@ pub const TIMER_UPDATE_CHECK: usize = 4;
 /// not involve a foreground transition (a background window calling
 /// SetWindowPos, or the shell reordering after explorer restarts).
 pub const TIMER_TOPMOST: usize = 5;
+/// Retry taskbar attachment when the shell was not ready at startup (e.g. the
+/// app launched during login before explorer created the taskbar). Fires until
+/// a taskbar is found, then stops. Without it a first attach that finds no
+/// taskbar is terminal: the widget stays stranded at its (0,0) creation spot
+/// because the explorer-restart watchdog only recovers a taskbar that changes
+/// after a successful attach, never a first attach that never happened.
+pub const TIMER_TASKBAR_RETRY: usize = 6;
 
 // Custom messages
 pub const WM_APP: u32 = 0x8000;
