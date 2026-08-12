@@ -1,6 +1,6 @@
 [package]
 name = "stealthy-usage-monitor"
-version = "2.4.0"
+version = "2.4.1"
 edition = "2021"
 license = "MIT"
 description = "Stealthy Usage Monitor"
@@ -22,7 +22,11 @@ Comments = "https://github.com/Xilous/stealthy-usage-monitor"
 LegalCopyright = "Copyright (C) 2026 Code Zeno Pty Ltd"
 
 [dependencies]
-ureq = { version = "2", default-features = false, features = ["native-tls", "json", "proxy-from-env"] }
+# Both TLS backends are compiled in: the poller uses native-tls (Schannel) via
+# .tls_connector(); the updater's downloads use rustls (the "tls" feature) so
+# release-asset downloads don't depend on the machine's Schannel/cert store,
+# which fails the handshake with GitHub's asset CDN on some Windows machines.
+ureq = { version = "2", default-features = false, features = ["native-tls", "tls", "json", "proxy-from-env"] }
 native-tls = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

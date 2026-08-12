@@ -211,11 +211,15 @@ fn fetch_latest_release() -> Result<Option<ReleaseDescriptor>, String> {
 }
 
 fn build_agent() -> Result<ureq::Agent, String> {
-    let tls = native_tls::TlsConnector::new()
-        .map_err(|e| format!("Unable to initialize TLS support for update checks: {e}"))?;
+    // Use rustls (bundled Mozilla roots) rather than native-tls for update
+    // traffic. native-tls goes through Schannel, whose TLS handshake with
+    // GitHub's release-asset CDN (release-assets.githubusercontent.com) fails
+    // with "unexpected eof" on some Windows machines, even though the same
+    // client reaches api.github.com fine. Omitting .tls_connector() makes ureq
+    // fall back to its rustls backend (the "tls" feature), which carries its
+    // own root store and sidesteps the machine's Schannel/cert-store quirks.
     Ok(ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(30))
-        .tls_connector(std::sync::Arc::new(tls))
         .build())
 }
 

@@ -904,6 +904,7 @@ fn begin_update_check(hwnd: HWND, interactive: bool) {
                 }
             }
             Err(error) => {
+                diagnose::log(format!("update check failed: {error}"));
                 {
                     let mut state = lock_state();
                     if let Some(s) = state.as_mut() {
@@ -955,6 +956,7 @@ fn begin_update_apply(hwnd: HWND, release: ReleaseDescriptor) {
                 let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
             },
             Err(error) => {
+                diagnose::log(format!("update download/apply failed: {error}"));
                 {
                     let mut state = lock_state();
                     if let Some(s) = state.as_mut() {
