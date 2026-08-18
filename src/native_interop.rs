@@ -30,6 +30,10 @@ pub const TIMER_TOPMOST: usize = 5;
 /// because the explorer-restart watchdog only recovers a taskbar that changes
 /// after a successful attach, never a first attach that never happened.
 pub const TIMER_TASKBAR_RETRY: usize = 6;
+/// Refreshes the device RAM readout. Fires every couple of seconds, but only
+/// forces a repaint when the whole-number percentage actually changes, so a
+/// stable system stays quiet.
+pub const TIMER_RAM: usize = 7;
 
 // Custom messages
 pub const WM_APP: u32 = 0x8000;
