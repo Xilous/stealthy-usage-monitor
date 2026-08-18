@@ -9,6 +9,7 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
 use windows::Win32::System::Registry::*;
+use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
 use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 use windows::Win32::UI::HiDpi::*;
@@ -20,7 +21,8 @@ use crate::diagnose;
 use crate::localization::{self, LanguageId, Strings};
 use crate::models::AppUsageData;
 use crate::native_interop::{
-    self, Color, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_POLL, TIMER_TOPMOST, TIMER_UPDATE_CHECK,
+    self, Color, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RAM, TIMER_RESET_POLL, TIMER_TOPMOST,
+    TIMER_UPDATE_CHECK,
     WM_APP_TRAY,
     WM_APP_USAGE_UPDATED,
 };
@@ -149,6 +151,12 @@ static SUPPRESS_TRAY_REPOSITION_UNTIL: Mutex<Option<Instant>> = Mutex::new(None)
 
 /// Current system DPI (96 = 100% scaling, 144 = 150%, 192 = 200%, etc.)
 static CURRENT_DPI: AtomicU32 = AtomicU32::new(96);
+
+/// Whole-number RAM percentage most recently painted. The RAM timer compares
+/// the live reading against this and only repaints when it differs, so a stable
+/// system does not churn the widget every tick. `u32::MAX` is the "never
+/// painted" sentinel, which always looks like a change on the first tick.
+static LAST_RAM_PERCENT: AtomicU32 = AtomicU32::new(u32::MAX);
 
 /// Scale a base pixel value (designed at 96 DPI) to the current DPI.
 fn sc(px: i32) -> i32 {
@@ -1131,6 +1139,21 @@ const MODEL_RIGHT_MARGIN: i32 = 3;
 const RIGHT_MARGIN: i32 = 1;
 const WIDGET_HEIGHT: i32 = 46;
 
+// RAM section, drawn on the left between the drag handle and the model bars:
+// a vertical fill bar (fills bottom-to-top), a "NN%" readout, and a thin
+// divider before the model content.
+const RAM_BAR_W: i32 = 6;
+const RAM_BAR_TEXT_GAP: i32 = 5;
+// Wide enough that "100%" never clips at the default font size.
+const RAM_TEXT_W: i32 = 32;
+const RAM_TEXT_RIGHT_MARGIN: i32 = 9;
+const RAM_DIVIDER_W: i32 = 1;
+const RAM_DIVIDER_RIGHT_MARGIN: i32 = 10;
+
+/// How often the live RAM reading is sampled. A repaint only happens when the
+/// whole-number percentage changes, so this cadence is cheap on a stable system.
+const RAM_REFRESH_MS: u32 = 2000;
+
 /// How far the pace marker needle extends above and below the bar.
 const PACE_MARKER_OVERHANG: i32 = 2;
 
@@ -1196,11 +1219,41 @@ fn row_bar_segment_count(active_models: i32) -> i32 {
     }
 }
 
+/// Live physical-memory load as a whole-number percentage (0-100). Uses
+/// GlobalMemoryStatusEx, whose dwMemoryLoad field is already "percent of
+/// physical RAM in use", so no arithmetic is needed. Returns 0 if the call
+/// fails, which just draws an empty bar rather than crashing the paint.
+fn current_ram_percent() -> u32 {
+    unsafe {
+        let mut status = MEMORYSTATUSEX {
+            dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+            ..Default::default()
+        };
+        if GlobalMemoryStatusEx(&mut status).is_ok() {
+            status.dwMemoryLoad.min(100)
+        } else {
+            0
+        }
+    }
+}
+
+/// Total horizontal space the RAM section occupies: the vertical bar, a gap,
+/// the percentage text, its right margin, the divider, and the divider margin.
+fn ram_section_width() -> i32 {
+    sc(RAM_BAR_W)
+        + sc(RAM_BAR_TEXT_GAP)
+        + sc(RAM_TEXT_W)
+        + sc(RAM_TEXT_RIGHT_MARGIN)
+        + sc(RAM_DIVIDER_W)
+        + sc(RAM_DIVIDER_RIGHT_MARGIN)
+}
+
 fn total_widget_width_for(active_models: i32) -> i32 {
     let model_width = model_usage_width(row_bar_segment_count(active_models));
 
     sc(LEFT_DIVIDER_W)
         + sc(DIVIDER_RIGHT_MARGIN)
+        + ram_section_width()
         + sc(LABEL_WIDTH)
         + sc(LABEL_RIGHT_MARGIN)
         + model_width * active_models
@@ -1241,6 +1294,17 @@ fn codex_accent_color(is_dark: bool) -> Color {
 
 fn antigravity_accent_color() -> Color {
     Color::from_hex("#4285F4")
+}
+
+/// Accent for the device RAM bar. A violet, echoing the memory graph in
+/// Windows Task Manager, so it reads as a system metric and stays distinct from
+/// the model accents (Claude terracotta, Codex mono, Antigravity blue).
+fn ram_accent_color(is_dark: bool) -> Color {
+    if is_dark {
+        Color::from_hex("#A78BDB")
+    } else {
+        Color::from_hex("#7E57C2")
+    }
 }
 
 fn claude_usage_text_color(is_dark: bool) -> Color {
@@ -1524,6 +1588,12 @@ pub fn run() {
                 .unwrap_or(POLL_15_MIN)
         };
         SetTimer(hwnd, TIMER_POLL, initial_poll_ms, None);
+
+        // RAM readout timer. Fires every couple of seconds but only repaints
+        // when the whole-number percentage changes (see the TIMER_RAM handler).
+        // Like TIMER_POLL, it is armed once here; an explorer restart relaunches
+        // the whole process, which re-runs this setup.
+        SetTimer(hwnd, TIMER_RAM, RAM_REFRESH_MS, None);
 
         // Watch for explorer.exe restarts so we can re-embed and re-add the tray
         // icon (the shell discards tray registrations when it restarts). This
@@ -1845,7 +1915,10 @@ fn paint_content(
         FillRect(hdc, &right_rect, right_brush);
         let _ = DeleteObject(right_brush);
 
-        let content_x = sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN);
+        // The RAM section sits between the drag handle and the model bars; the
+        // model content starts after it.
+        let ram_x = sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN);
+        let content_x = ram_x + ram_section_width();
         let row2_y = height - sc(5) - sc(SEGMENT_H);
         let row1_y = row2_y - sc(10) - sc(SEGMENT_H);
 
@@ -1870,6 +1943,23 @@ fn paint_content(
             PCWSTR::from_raw(font_name.as_ptr()),
         );
         let old_font = SelectObject(hdc, font);
+
+        // Device RAM: a vertical fill bar plus a percentage readout, spanning
+        // the vertical extent of both model rows. Sampled live at paint time;
+        // record what we drew so the RAM timer can tell when it changed.
+        let ram_percent = current_ram_percent();
+        LAST_RAM_PERCENT.store(ram_percent, Ordering::Relaxed);
+        draw_ram_section(
+            hdc,
+            ram_x,
+            height,
+            row1_y,
+            row2_y + sc(SEGMENT_H),
+            ram_percent,
+            is_dark,
+            text_color,
+            track,
+        );
 
         draw_row(
             hdc,
@@ -2486,6 +2576,20 @@ unsafe extern "system" fn wnd_proc(
                     update_display();
                     render_layered();
                     schedule_countdown_timer();
+                }
+                TIMER_RAM => {
+                    // Only repaint when the displayed percentage actually
+                    // changes, and skip the work entirely while the widget is
+                    // hidden.
+                    let visible = {
+                        let state = lock_state();
+                        state.as_ref().map(|s| s.widget_visible).unwrap_or(false)
+                    };
+                    if visible
+                        && current_ram_percent() != LAST_RAM_PERCENT.load(Ordering::Relaxed)
+                    {
+                        render_layered();
+                    }
                 }
                 TIMER_RESET_POLL => {
                     let should_poll = {
@@ -3606,5 +3710,117 @@ fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
         let _ = FillRgn(hdc, rgn, brush);
         let _ = DeleteObject(rgn);
         let _ = DeleteObject(brush);
+    }
+}
+
+/// Draw a vertical bar filled from the bottom up to `percent`. The track is
+/// painted first, then the accent fill is clipped to the rounded outline so its
+/// bottom corners stay rounded like the usage bars.
+fn draw_vertical_fill_bar(
+    hdc: HDC,
+    rect: &RECT,
+    percent: f64,
+    accent: &Color,
+    track: &Color,
+    radius: i32,
+) {
+    unsafe {
+        draw_rounded_rect(hdc, rect, track, radius);
+
+        let percent = percent.clamp(0.0, 100.0);
+        if percent <= 0.0 {
+            return;
+        }
+        let height = rect.bottom - rect.top;
+        let fill_h = ((height as f64) * percent / 100.0).round() as i32;
+        if fill_h <= 0 {
+            return;
+        }
+        let fill_rect = RECT {
+            left: rect.left,
+            top: rect.bottom - fill_h,
+            right: rect.right,
+            bottom: rect.bottom,
+        };
+        let rgn = CreateRoundRectRgn(
+            rect.left,
+            rect.top,
+            rect.right + 1,
+            rect.bottom + 1,
+            radius * 2,
+            radius * 2,
+        );
+        let _ = SelectClipRgn(hdc, rgn);
+        let brush = CreateSolidBrush(COLORREF(accent.to_colorref()));
+        FillRect(hdc, &fill_rect, brush);
+        let _ = DeleteObject(brush);
+        let _ = SelectClipRgn(hdc, HRGN::default());
+        let _ = DeleteObject(rgn);
+    }
+}
+
+/// Draw the device RAM section: a vertical fill bar, a "NN%" readout to its
+/// right, and a thin divider separating it from the model bars. `bar_top` and
+/// `bar_bottom` are the vertical extent of the two model rows so the bar and
+/// text line up with them; `height` is the full widget height, used to centre
+/// the divider like the drag-handle divider.
+fn draw_ram_section(
+    hdc: HDC,
+    x: i32,
+    height: i32,
+    bar_top: i32,
+    bar_bottom: i32,
+    percent: u32,
+    is_dark: bool,
+    text_color: &Color,
+    track: &Color,
+) {
+    let accent = ram_accent_color(is_dark);
+    let bar_w = sc(RAM_BAR_W);
+
+    unsafe {
+        let bar_rect = RECT {
+            left: x,
+            top: bar_top,
+            right: x + bar_w,
+            bottom: bar_bottom,
+        };
+        draw_vertical_fill_bar(hdc, &bar_rect, percent as f64, &accent, track, sc(CORNER_RADIUS));
+
+        let text_x = x + bar_w + sc(RAM_BAR_TEXT_GAP);
+        let mut text_wide: Vec<u16> = format!("{percent}%").encode_utf16().collect();
+        let mut text_rect = RECT {
+            left: text_x,
+            top: bar_top,
+            right: text_x + sc(RAM_TEXT_W),
+            bottom: bar_bottom,
+        };
+        let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
+        let _ = DrawTextW(
+            hdc,
+            &mut text_wide,
+            &mut text_rect,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+        );
+
+        // Thin divider before the model bars, centred vertically to match the
+        // drag-handle divider on the far left.
+        let divider_x = text_x + sc(RAM_TEXT_W) + sc(RAM_TEXT_RIGHT_MARGIN);
+        let divider_h = sc(25);
+        let divider_top = (height - divider_h) / 2;
+        let div_col = if is_dark {
+            native_interop::colorref(70, 70, 70)
+        } else {
+            native_interop::colorref(200, 200, 200)
+        };
+        let div_brush = CreateSolidBrush(COLORREF(div_col));
+        let div_rect = RECT {
+            left: divider_x,
+            top: divider_top,
+            right: divider_x + sc(RAM_DIVIDER_W),
+            bottom: divider_top + divider_h,
+        };
+        FillRect(hdc, &div_rect, div_brush);
+        let _ = DeleteObject(div_brush);
     }
 }
