@@ -3912,54 +3912,80 @@ fn draw_ram_ring(hdc: HDC, x: i32, height: i32, percent: u32, is_dark: bool, bg:
     let r_mid = (r_out + r_in) / 2;
     let frac = (percent.min(100) as f64) / 100.0;
 
-    unsafe {
-        let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
-        let _ = SetArcDirection(hdc, AD_CLOCKWISE);
+    // Supersample the ring: GDI draws no antialiasing, so render it at SSx into
+    // an offscreen buffer and downscale with a HALFTONE stretch, which averages
+    // the pixels into smooth edges. Radii below are in 1x units, scaled by SS
+    // only at draw time.
+    const SS: i32 = 4;
+    let margin = sc(4);
+    let box_l = cx - r_out - margin;
+    let box_t = cy - r_out - margin;
+    let box_w = (r_out + margin) * 2;
+    let box_h = (r_out + margin) * 2;
 
-        // Fill a full disc of `radius` in `color` using the null pen so there is
-        // no outline. The closure needs its own unsafe block: an outer unsafe
-        // context does not extend across the closure boundary.
+    unsafe {
+        let mem = CreateCompatibleDC(hdc);
+        let bmp = CreateCompatibleBitmap(hdc, box_w * SS, box_h * SS);
+        let old_bmp = SelectObject(mem, bmp);
+
+        // Ring centre inside the offscreen buffer, in supersampled coordinates.
+        let scx = (cx - box_l) * SS;
+        let scy = (cy - box_t) * SS;
+
+        // Fill with the taskbar background so the antialiased edges blend against
+        // it, matching what the widget composites over.
+        let bg_brush = CreateSolidBrush(COLORREF(bg.to_colorref()));
+        let full = RECT { left: 0, top: 0, right: box_w * SS, bottom: box_h * SS };
+        FillRect(mem, &full, bg_brush);
+        let _ = DeleteObject(bg_brush);
+
+        let old_pen = SelectObject(mem, GetStockObject(NULL_PEN));
+        let _ = SetArcDirection(mem, AD_CLOCKWISE);
+
+        // Fill a full disc of `radius` (1x units) with no outline. Its own unsafe
+        // block: an outer unsafe context does not extend across the closure.
         let fill_disc = move |radius: i32, color: Color| unsafe {
+            let rr = radius * SS;
             let brush = CreateSolidBrush(COLORREF(color.to_colorref()));
-            let old = SelectObject(hdc, brush);
-            let _ = Ellipse(hdc, cx - radius, cy - radius, cx + radius + 1, cy + radius + 1);
-            SelectObject(hdc, old);
+            let old = SelectObject(mem, brush);
+            let _ = Ellipse(mem, scx - rr, scy - rr, scx + rr + 1, scy + rr + 1);
+            SelectObject(mem, old);
             let _ = DeleteObject(brush);
         };
 
-        // Breathing outer glow: a faint emerald halo just outside the ring.
+        // Breathing outer glow.
         if breath > 0.02 {
             fill_disc(r_out + sc(3), blend(*bg, led.glow, 0.10 + 0.30 * breath));
         }
-
-        // Track: a full grey ring (hollowed out below).
+        // Track ring.
         fill_disc(r_out, track);
 
         // Progress arc as a wedge, brightened by the breath.
         if frac > 0.0 {
             let arc_col = blend(led.mid, led.core, 0.10 + 0.35 * breath);
+            let rr = r_out * SS;
             let brush = CreateSolidBrush(COLORREF(arc_col.to_colorref()));
-            let old = SelectObject(hdc, brush);
+            let old = SelectObject(mem, brush);
             if frac >= 0.999 {
-                let _ = Ellipse(hdc, cx - r_out, cy - r_out, cx + r_out + 1, cy + r_out + 1);
+                let _ = Ellipse(mem, scx - rr, scy - rr, scx + rr + 1, scy + rr + 1);
             } else {
                 let a = frac * std::f64::consts::TAU;
-                let big = (d * 2).max(64);
-                let ex = cx + (big as f64 * a.sin()).round() as i32;
-                let ey = cy - (big as f64 * a.cos()).round() as i32;
+                let big = (d * 2 * SS).max(256);
+                let ex = scx + (big as f64 * a.sin()).round() as i32;
+                let ey = scy - (big as f64 * a.cos()).round() as i32;
                 let _ = Pie(
-                    hdc,
-                    cx - r_out,
-                    cy - r_out,
-                    cx + r_out + 1,
-                    cy + r_out + 1,
-                    cx,
-                    cy - big,
+                    mem,
+                    scx - rr,
+                    scy - rr,
+                    scx + rr + 1,
+                    scy + rr + 1,
+                    scx,
+                    scy - big,
                     ex,
                     ey,
                 );
             }
-            SelectObject(hdc, old);
+            SelectObject(mem, old);
             let _ = DeleteObject(brush);
         }
 
@@ -3969,25 +3995,37 @@ fn draw_ram_ring(hdc: HDC, x: i32, height: i32, percent: u32, is_dark: bool, bg:
         // Bead marker riding the arc head.
         if frac > 0.0 {
             let a = frac * std::f64::consts::TAU;
-            let bx = cx + (r_mid as f64 * a.sin()).round() as i32;
-            let by = cy - (r_mid as f64 * a.cos()).round() as i32;
+            let bx = scx + ((r_mid * SS) as f64 * a.sin()).round() as i32;
+            let by = scy - ((r_mid * SS) as f64 * a.cos()).round() as i32;
             if breath > 0.02 {
-                let hr = stroke + sc(2);
-                let brush = CreateSolidBrush(COLORREF(blend(*bg, led.glow, 0.35 * breath).to_colorref()));
-                let old = SelectObject(hdc, brush);
-                let _ = Ellipse(hdc, bx - hr, by - hr, bx + hr + 1, by + hr + 1);
-                SelectObject(hdc, old);
+                let hr = (stroke + sc(2)) * SS;
+                let brush =
+                    CreateSolidBrush(COLORREF(blend(*bg, led.glow, 0.35 * breath).to_colorref()));
+                let old = SelectObject(mem, brush);
+                let _ = Ellipse(mem, bx - hr, by - hr, bx + hr + 1, by + hr + 1);
+                SelectObject(mem, old);
                 let _ = DeleteObject(brush);
             }
-            let core_r = (stroke * 2 / 3).max(2);
+            let core_r = (stroke * 2 / 3).max(2) * SS;
             let brush = CreateSolidBrush(COLORREF(led.core.to_colorref()));
-            let old = SelectObject(hdc, brush);
-            let _ = Ellipse(hdc, bx - core_r, by - core_r, bx + core_r + 1, by + core_r + 1);
-            SelectObject(hdc, old);
+            let old = SelectObject(mem, brush);
+            let _ = Ellipse(mem, bx - core_r, by - core_r, bx + core_r + 1, by + core_r + 1);
+            SelectObject(mem, old);
             let _ = DeleteObject(brush);
         }
 
-        SelectObject(hdc, old_pen);
+        SelectObject(mem, old_pen);
+
+        // Downscale the supersampled ring into the widget DC for antialiasing.
+        let _ = SetStretchBltMode(hdc, HALFTONE);
+        let _ = SetBrushOrgEx(hdc, 0, 0, None);
+        let _ = StretchBlt(
+            hdc, box_l, box_t, box_w, box_h, mem, 0, 0, box_w * SS, box_h * SS, SRCCOPY,
+        );
+
+        SelectObject(mem, old_bmp);
+        let _ = DeleteObject(bmp);
+        let _ = DeleteDC(mem);
 
         // Centred "NN%" readout, in a smaller font than the row labels.
         let font_name = native_interop::wide_str("Segoe UI");
