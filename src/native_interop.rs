@@ -34,6 +34,10 @@ pub const TIMER_TASKBAR_RETRY: usize = 6;
 /// forces a repaint when the whole-number percentage actually changes, so a
 /// stable system stays quiet.
 pub const TIMER_RAM: usize = 7;
+/// Drives the ambient animation (the breathing LED glow and the RAM ring).
+/// Fires continuously at roughly 30fps while the widget is visible, and is
+/// stopped whenever the widget is hidden so a hidden widget costs nothing.
+pub const TIMER_ANIM: usize = 8;
 
 // Custom messages
 pub const WM_APP: u32 = 0x8000;
