@@ -32,6 +32,7 @@ pub(super) const STRINGS: Strings = Strings {
     update_prompt_now: "Versie {version} is beschikbaar. Wil je nu bijwerken?",
     exit: "Afsluiten",
     show_widget: "Widget tonen",
+    weekday_initials: ["Z", "M", "D", "W", "D", "V", "Z"],
     session_window: "5u",
     weekly_window: "7d",
     now: "nu",

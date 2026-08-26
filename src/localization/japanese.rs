@@ -32,6 +32,7 @@ pub(super) const STRINGS: Strings = Strings {
     update_prompt_now: "バージョン {version} が利用可能です。今すぐ更新しますか？",
     exit: "終了",
     show_widget: "ウィジェットを表示",
+    weekday_initials: ["日", "月", "火", "水", "木", "金", "土"],
     session_window: "5h",
     weekly_window: "7d",
     now: "今",

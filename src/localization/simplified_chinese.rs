@@ -32,6 +32,7 @@ pub(super) const STRINGS: Strings = Strings {
     update_prompt_now: "版本 {version} 已可用。是否立即更新？",
     exit: "退出",
     show_widget: "显示小组件",
+    weekday_initials: ["日", "一", "二", "三", "四", "五", "六"],
     session_window: "5h",
     weekly_window: "7d",
     now: "现在",

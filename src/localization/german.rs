@@ -32,6 +32,7 @@ pub(super) const STRINGS: Strings = Strings {
     update_prompt_now: "Version {version} ist verfügbar. Möchten Sie jetzt aktualisieren?",
     exit: "Beenden",
     show_widget: "Widget anzeigen",
+    weekday_initials: ["So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"],
     session_window: "5h",
     weekly_window: "7d",
     now: "jetzt",
