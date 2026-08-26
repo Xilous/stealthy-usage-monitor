@@ -9,7 +9,9 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
 use windows::Win32::System::Registry::*;
-use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+use windows::Win32::System::SystemInformation::{
+    GetLocalTime, GlobalMemoryStatusEx, MEMORYSTATUSEX,
+};
 use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
 use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 use windows::Win32::UI::HiDpi::*;
@@ -19,7 +21,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::diagnose;
 use crate::localization::{self, LanguageId, Strings};
-use crate::models::AppUsageData;
+use crate::models::{AppUsageData, UsageData};
 use crate::native_interop::{
     self, Color, TIMER_ANIM, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RAM, TIMER_RESET_POLL,
     TIMER_TOPMOST, TIMER_UPDATE_CHECK,
@@ -1186,6 +1188,98 @@ fn claude_pace_markers(data: Option<&AppUsageData>) -> (Option<f64>, Option<f64>
     }
 }
 
+/// Days from 1970-01-01 for a proleptic-Gregorian civil date. Howard Hinnant's
+/// `days_from_civil`; std has no calendar arithmetic and the widget only ever
+/// needs whole days, so a date crate would be all cost and no benefit.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = y - (m <= 2) as i64;
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// Seconds the local clock currently runs ahead of UTC, DST included. Windows
+/// hands over the local wall clock directly, so the offset is that minus the
+/// unix clock. The two readings are taken microseconds apart but can still
+/// straddle a second boundary; real offsets are whole minutes, so the rounding
+/// discards that jitter.
+fn local_utc_offset_secs() -> i64 {
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let lt = unsafe { GetLocalTime() };
+    let local = days_from_civil(lt.wYear as i64, lt.wMonth as i64, lt.wDay as i64) * 86_400
+        + lt.wHour as i64 * 3_600
+        + lt.wMinute as i64 * 60
+        + lt.wSecond as i64;
+    (((local - now_unix) as f64) / 60.0).round() as i64 * 60
+}
+
+/// Which local calendar day an instant falls on, as days from 1970-01-01.
+/// Every instant is shifted by *today's* offset, so a reset landing within an
+/// hour of midnight on the far side of a DST change can name the neighbouring
+/// day. That is the whole error budget, and it is not worth a timezone database.
+fn local_day_number(t: SystemTime) -> Option<i64> {
+    let unix = t.duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
+    Some((unix + local_utc_offset_secs()).div_euclid(86_400))
+}
+
+/// Weekday of a day number, 0 = Sunday. 1970-01-01 was a Thursday.
+fn weekday_of(day_number: i64) -> usize {
+    (day_number + 4).rem_euclid(7) as usize
+}
+
+/// The weekly bar's seven blocks resolved to real weekdays.
+///
+/// The window ends when the quota resets, so the rightmost block is the day the
+/// reset lands on and the six to its left walk backwards from there: a Saturday
+/// reset makes the row read Sun through Sat.
+#[derive(Clone, Copy)]
+struct WeekBlocks {
+    /// Weekday index (0 = Sunday) per block, left to right.
+    days: [usize; WEEKLY_BLOCKS as usize],
+    /// Block covering today. `None` once the reset instant has gone stale and
+    /// today no longer falls inside the window it describes.
+    today: Option<usize>,
+}
+
+fn week_blocks(resets_at: Option<SystemTime>) -> Option<WeekBlocks> {
+    let last = local_day_number(resets_at?)?;
+    let mut days = [0usize; WEEKLY_BLOCKS as usize];
+    for (i, day) in days.iter_mut().enumerate() {
+        *day = weekday_of(last - (WEEKLY_BLOCKS as i64 - 1 - i as i64));
+    }
+    let today = local_day_number(SystemTime::now())
+        .map(|now| WEEKLY_BLOCKS as i64 - 1 - (last - now))
+        .filter(|i| (0..WEEKLY_BLOCKS as i64).contains(i))
+        .map(|i| i as usize);
+    Some(WeekBlocks { days, today })
+}
+
+/// Weekly-bar day markers for every model, resolved once per paint. A model
+/// with no known reset time keeps plain, unlabelled dividers.
+#[derive(Clone, Copy, Default)]
+struct WeekMarkers {
+    claude: Option<WeekBlocks>,
+    codex: Option<WeekBlocks>,
+    antigravity: Option<WeekBlocks>,
+}
+
+fn week_markers(data: Option<&AppUsageData>) -> WeekMarkers {
+    let blocks = |usage: Option<&UsageData>| week_blocks(usage.and_then(|u| u.weekly.resets_at));
+    match data {
+        Some(d) => WeekMarkers {
+            claude: blocks(d.claude_code.as_ref()),
+            codex: blocks(d.codex.as_ref()),
+            antigravity: blocks(d.antigravity.as_ref()),
+        },
+        None => WeekMarkers::default(),
+    }
+}
+
 fn pace_marker_color(is_dark: bool) -> Color {
     if is_dark {
         Color::from_hex("#E0E0E0")
@@ -1217,12 +1311,13 @@ fn active_model_count(show_claude_code: bool, show_codex: bool, show_antigravity
     (show_claude_code as i32 + show_codex as i32 + show_antigravity as i32).max(1)
 }
 
-fn row_bar_segment_count(active_models: i32) -> i32 {
-    match active_models {
-        1 => SEGMENT_COUNT,
-        2 => 5,
-        _ => 4,
-    }
+/// Bars are one width no matter how many models are on screen. The weekly row
+/// stamps a weekday initial into each of its seven blocks, and a block only
+/// clears a glyph at the full segment count: the old narrower bars for two and
+/// three models left blocks about seven and five pixels wide, where nothing
+/// legible fits. The widget is wider for it.
+fn row_bar_segment_count(_active_models: i32) -> i32 {
+    SEGMENT_COUNT
 }
 
 /// Live physical-memory load as a whole-number percentage (0-100). Uses
@@ -1405,6 +1500,52 @@ fn anim_breath() -> f64 {
     let t = start.elapsed().as_secs_f64();
     let s = 0.5 + 0.5 * (t * 1.15).sin();
     s * s * (3.0 - 2.0 * s)
+}
+
+/// Relative luminance, 0..1. Decides whether a weekday letter needs dark or
+/// light ink to hold up against a given LED.
+fn luminance(c: Color) -> f64 {
+    (0.2126 * c.r as f64 + 0.7152 * c.g as f64 + 0.0722 * c.b as f64) / 255.0
+}
+
+/// Ink for a weekday letter standing on the lit part of a bar.
+///
+/// The fill is a moving target: draw_led_fill sweeps its centre row from a dim,
+/// veiled body colour at the bottom of the breath to a near-white core at the
+/// top, and the letters sit on exactly that centre row. Only an ink at one
+/// extreme clears a contrast threshold against both ends of that sweep, so this
+/// picks the extreme the LED is not - near-black against a bright palette,
+/// near-white against a dark one - and goes all the way there rather than
+/// splitting the difference.
+fn day_ink_on_fill(led: &Led) -> Color {
+    if luminance(led.mid) > 0.45 {
+        blend(led.edge, Color::from_hex("#01070C"), 0.80)
+    } else {
+        blend(led.mid, Color::from_hex("#FFFFFF"), 0.86)
+    }
+}
+
+/// Ink for a weekday letter over bare track.
+///
+/// The LED palettes are tuned to look right as a fill, not to be read against
+/// the track, and some of them (Codex in light mode) run light exactly where the
+/// track is light. So the base is a neutral pushed away from the track's own
+/// lightness, which is the only thing that reliably clears a contrast threshold
+/// on both a light and a dark taskbar; `tint` then pulls it back toward the LED,
+/// which is how today's letter earns its colour without losing legibility.
+fn day_ink_on_track(track: &Color, led: &Led, tint: f64) -> Color {
+    if luminance(*track) > 0.5 {
+        let mut hue = led.edge;
+        if luminance(led.mid) < luminance(hue) {
+            hue = led.mid;
+        }
+        if luminance(led.core) < luminance(hue) {
+            hue = led.core;
+        }
+        blend(blend(*track, Color::from_hex("#101010"), 0.62), hue, tint)
+    } else {
+        blend(blend(*track, Color::from_hex("#FFFFFF"), 0.62), led.glow, tint)
+    }
 }
 
 fn claude_usage_text_color(is_dark: bool) -> Color {
@@ -1754,6 +1895,7 @@ fn render_layered() {
         session_pct,
         session_pace,
         weekly_pace,
+        week,
         session_text,
         weekly_pct,
         weekly_text,
@@ -1781,6 +1923,7 @@ fn render_layered() {
                     s.session_percent,
                     session_pace,
                     weekly_pace,
+                    week_markers(s.data.as_ref()),
                     s.session_text.clone(),
                     s.weekly_percent,
                     s.weekly_text.clone(),
@@ -1876,6 +2019,7 @@ fn render_layered() {
             &accent,
             &track,
             strings,
+            week,
             session_pct,
             session_pace,
             &session_text,
@@ -1954,6 +2098,7 @@ fn paint_content(
     accent: &Color,
     track: &Color,
     strings: Strings,
+    week: WeekMarkers,
     session_pct: f64,
     session_pace: Option<f64>,
     session_text: &str,
@@ -2070,7 +2215,9 @@ fn paint_content(
             is_dark,
             text_color,
             strings.session_window,
+            &strings.weekday_initials,
             SESSION_BLOCKS,
+            None,
             session_pct,
             session_pace,
             session_text,
@@ -2091,7 +2238,9 @@ fn paint_content(
             is_dark,
             text_color,
             strings.weekly_window,
+            &strings.weekday_initials,
             WEEKLY_BLOCKS,
+            Some(week),
             weekly_pct,
             weekly_pace,
             weekly_text,
@@ -3444,6 +3593,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
         session_pct,
         session_pace,
         weekly_pace,
+        week,
         session_text,
         weekly_pct,
         weekly_text,
@@ -3469,6 +3619,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
                     s.session_percent,
                     session_pace,
                     weekly_pace,
+                    week_markers(s.data.as_ref()),
                     s.session_text.clone(),
                     s.weekly_percent,
                     s.weekly_text.clone(),
@@ -3532,6 +3683,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
             &accent,
             &track,
             strings,
+            week,
             session_pct,
             session_pace,
             &session_text,
@@ -3568,7 +3720,9 @@ fn draw_row(
     is_dark: bool,
     text_color: &Color,
     label: &str,
+    weekdays: &[&'static str; 7],
     blocks: i32,
+    week: Option<WeekMarkers>,
     claude_percent: f64,
     claude_pace: Option<f64>,
     claude_text: &str,
@@ -3626,6 +3780,8 @@ fn draw_row(
                 y,
                 segment_count,
                 blocks,
+                week.and_then(|w| w.claude),
+                weekdays,
                 claude_percent,
                 claude_pace,
                 claude_text,
@@ -3644,6 +3800,8 @@ fn draw_row(
                 y,
                 segment_count,
                 blocks,
+                week.and_then(|w| w.codex),
+                weekdays,
                 codex_percent,
                 None,
                 codex_text,
@@ -3662,6 +3820,8 @@ fn draw_row(
                 y,
                 segment_count,
                 blocks,
+                week.and_then(|w| w.antigravity),
+                weekdays,
                 antigravity_percent,
                 None,
                 antigravity_text,
@@ -3704,6 +3864,8 @@ fn draw_usage_bar(
     y: i32,
     segment_count: i32,
     blocks: i32,
+    week: Option<WeekBlocks>,
+    weekdays: &[&'static str; 7],
     percent: f64,
     pace: Option<f64>,
     text: &str,
@@ -3783,6 +3945,14 @@ fn draw_usage_bar(
             let _ = DeleteObject(brush);
         }
 
+        // Weekday initials go on last so neither a day divider nor the pace
+        // needle ever cuts a letter in half.
+        if let Some(week) = week {
+            draw_day_letters(
+                hdc, bar_x, y, bar_w, fill_w, &week, weekdays, led, track, bg, breath,
+            );
+        }
+
         let text_x = bar_x + bar_w + sc(BAR_RIGHT_MARGIN);
         let mut text_wide: Vec<u16> = text.encode_utf16().collect();
         let mut text_rect = RECT {
@@ -3798,6 +3968,200 @@ fn draw_usage_bar(
             &mut text_rect,
             DT_LEFT | DT_VCENTER | DT_SINGLELINE,
         );
+    }
+}
+
+/// Font for the in-bar weekday initials. Small enough that a two-character
+/// abbreviation still clears the narrowest block, heavy enough to survive being
+/// drawn on top of a glowing gradient.
+fn day_font(weight: FONT_WEIGHT) -> HFONT {
+    let name = native_interop::wide_str("Segoe UI");
+    unsafe {
+        CreateFontW(
+            sc(-10),
+            0,
+            0,
+            0,
+            weight.0 as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET.0 as u32,
+            OUT_TT_PRECIS.0 as u32,
+            CLIP_DEFAULT_PRECIS.0 as u32,
+            CLEARTYPE_QUALITY.0 as u32,
+            (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
+            PCWSTR::from_raw(name.as_ptr()),
+        )
+    }
+}
+
+/// Draw a short label centred in `cell`, nudged by (dx, dy). Used both for the
+/// glyph itself and for the offset copies that make up today's bloom.
+fn draw_centered(hdc: HDC, cell: &RECT, label: &str, dx: i32, dy: i32) {
+    let mut wide: Vec<u16> = label.encode_utf16().collect();
+    let mut r = RECT {
+        left: cell.left + dx,
+        top: cell.top + dy,
+        right: cell.right + dx,
+        bottom: cell.bottom + dy,
+    };
+    unsafe {
+        let _ = DrawTextW(hdc, &mut wide, &mut r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+}
+
+/// Stamp the weekday initials into the weekly bar's seven blocks.
+///
+/// Each letter is drawn twice under complementary clips - once over the lit
+/// fill in dark ink, once over the bare track in a dimmed LED tint - so a letter
+/// straddling the fill edge stays readable on both sides of it. Today's block
+/// gets the loud treatment: a breathing wash behind it, bold weight, a bloom
+/// around the glyph, and a glowing rule under the bar so it is still findable
+/// once the fill has run past its cell.
+fn draw_day_letters(
+    hdc: HDC,
+    bar_x: i32,
+    y: i32,
+    bar_w: i32,
+    fill_w: i32,
+    week: &WeekBlocks,
+    weekdays: &[&'static str; 7],
+    led: &Led,
+    track: &Color,
+    bg: &Color,
+    breath: f64,
+) {
+    let seg_h = sc(SEGMENT_H);
+    let corner_r = sc(CORNER_RADIUS);
+    let gap = sc(SEGMENT_GAP);
+    let blocks = WEEKLY_BLOCKS;
+    let lit_hi = bar_x + fill_w.clamp(0, bar_w);
+
+    let cell_of = |index: i32| {
+        let (left, right) = block_bounds(bar_w, blocks, gap, index);
+        RECT {
+            left: bar_x + left,
+            top: y,
+            right: bar_x + right,
+            bottom: y + seg_h,
+        }
+    };
+
+    unsafe {
+        // Everything below is clipped to the bar's rounded silhouette so the
+        // first and last blocks do not square off its corners.
+        let bar_rgn = CreateRoundRectRgn(
+            bar_x,
+            y,
+            bar_x + bar_w + 1,
+            y + seg_h + 1,
+            corner_r * 2,
+            corner_r * 2,
+        );
+
+        // Breathing wash behind today, on the unlit side only: it tints bare
+        // track without dulling the LED where the two overlap.
+        if let Some(t) = week.today {
+            let _ = SelectClipRgn(hdc, bar_rgn);
+            let _ = IntersectClipRect(hdc, lit_hi, y, bar_x + bar_w, y + seg_h);
+            let wash = blend(*track, led.glow, 0.12 + 0.26 * breath);
+            let brush = CreateSolidBrush(COLORREF(wash.to_colorref()));
+            FillRect(hdc, &cell_of(t as i32), brush);
+            let _ = DeleteObject(brush);
+            let _ = SelectClipRgn(hdc, HRGN::default());
+        }
+
+        let normal = day_font(FW_SEMIBOLD);
+        let bold = day_font(FW_BOLD);
+        let old_font = SelectObject(hdc, normal);
+
+        // One pass per side of the fill edge: clip range, ordinary ink, today's
+        // ink, today's bloom colour, and whether that bloom is a single-corner
+        // emboss (over the LED, where a halo would only wash out) or a full
+        // four-way glow (over the track, where it reads as light).
+        let on_fill = day_ink_on_fill(led);
+        // The emboss always runs opposite the ink it outlines, so the glyph
+        // stays defined even at the point in the breath where ink and fill are
+        // closest in lightness.
+        let emboss_ink = if luminance(on_fill) > 0.5 {
+            Color::from_hex("#02070B")
+        } else {
+            blend(led.core, Color::from_hex("#FFFFFF"), 0.5)
+        };
+        let passes = [
+            (
+                bar_x,
+                lit_hi,
+                on_fill,
+                blend(on_fill, Color::from_hex("#000000"), 0.4),
+                emboss_ink,
+                true,
+            ),
+            (
+                lit_hi,
+                bar_x + bar_w,
+                day_ink_on_track(track, led, 0.22),
+                day_ink_on_track(track, led, 0.55),
+                blend(*track, led.glow, 0.30 + 0.50 * breath),
+                false,
+            ),
+        ];
+
+        for (lo, hi, ink, today_ink, bloom, emboss) in passes {
+            if hi <= lo {
+                continue;
+            }
+            let _ = SelectClipRgn(hdc, bar_rgn);
+            let _ = IntersectClipRect(hdc, lo, y, hi, y + seg_h);
+
+            for i in 0..blocks {
+                let cell = cell_of(i);
+                let is_today = week.today == Some(i as usize);
+                let label = weekdays[week.days[i as usize] % 7];
+                SelectObject(hdc, if is_today { bold } else { normal });
+
+                if is_today {
+                    let offsets: &[(i32, i32)] = if emboss {
+                        &[(-1, -1)]
+                    } else {
+                        &[(-1, 0), (1, 0), (0, -1), (0, 1)]
+                    };
+                    let _ = SetTextColor(hdc, COLORREF(bloom.to_colorref()));
+                    for (dx, dy) in offsets {
+                        draw_centered(hdc, &cell, label, *dx, *dy);
+                    }
+                }
+
+                let color = if is_today { today_ink } else { ink };
+                let _ = SetTextColor(hdc, COLORREF(color.to_colorref()));
+                draw_centered(hdc, &cell, label, 0, 0);
+            }
+
+            let _ = SelectClipRgn(hdc, HRGN::default());
+        }
+
+        SelectObject(hdc, old_font);
+        let _ = DeleteObject(normal);
+        let _ = DeleteObject(bold);
+        let _ = DeleteObject(bar_rgn);
+
+        // Glowing rule under today's block, outside the bar, so the current day
+        // stays marked even when its cell is fully lit.
+        if let Some(t) = week.today {
+            let cell = cell_of(t as i32);
+            let rule = blend(*bg, led.glow, 0.35 + 0.45 * breath);
+            let brush = CreateSolidBrush(COLORREF(rule.to_colorref()));
+            let top = y + seg_h + sc(2);
+            let r = RECT {
+                left: cell.left,
+                top,
+                right: cell.right,
+                bottom: top + sc(1).max(1),
+            };
+            FillRect(hdc, &r, brush);
+            let _ = DeleteObject(brush);
+        }
     }
 }
 

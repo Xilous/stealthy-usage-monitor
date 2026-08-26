@@ -174,6 +174,11 @@ pub struct Strings {
     pub update_prompt_now: &'static str,
     pub exit: &'static str,
     pub show_widget: &'static str,
+    /// Single-character initials for Sunday through Saturday, in that order,
+    /// drawn inside the seven blocks of the weekly bar. Languages whose days
+    /// collide on one letter (German, Russian) use their conventional
+    /// two-character abbreviation instead.
+    pub weekday_initials: [&'static str; 7],
     pub session_window: &'static str,
     pub weekly_window: &'static str,
     pub now: &'static str,
