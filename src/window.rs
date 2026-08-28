@@ -452,9 +452,11 @@ fn tray_icon_data_from_state() -> Vec<tray_icon::TrayIconData> {
                     kind: tray_icon::TrayIconKind::Claude,
                     percent: Some(s.session_percent),
                     tooltip: format!(
-                        "{} 5h: {} | 7d: {}",
+                        "{} 5h: {:.0}% {} | 7d: {:.0}% {}",
                         s.language.strings().claude_code_model,
+                        s.session_percent,
                         s.session_text,
+                        s.weekly_percent,
                         s.weekly_text
                     ),
                 });
@@ -464,9 +466,11 @@ fn tray_icon_data_from_state() -> Vec<tray_icon::TrayIconData> {
                     kind: tray_icon::TrayIconKind::Codex,
                     percent: Some(s.codex_session_percent),
                     tooltip: format!(
-                        "{} 5h: {} | 7d: {}",
+                        "{} 5h: {:.0}% {} | 7d: {:.0}% {}",
                         s.language.strings().codex_model,
+                        s.codex_session_percent,
                         s.codex_session_text,
+                        s.codex_weekly_percent,
                         s.codex_weekly_text
                     ),
                 });
@@ -476,9 +480,11 @@ fn tray_icon_data_from_state() -> Vec<tray_icon::TrayIconData> {
                     kind: tray_icon::TrayIconKind::Antigravity,
                     percent: Some(s.antigravity_session_percent),
                     tooltip: format!(
-                        "{} 5h: {} | 7d: {}",
+                        "{} 5h: {:.0}% {} | 7d: {:.0}% {}",
                         s.language.strings().antigravity_model,
+                        s.antigravity_session_percent,
                         s.antigravity_session_text,
+                        s.antigravity_weekly_percent,
                         s.antigravity_weekly_text
                     ),
                 });
@@ -695,6 +701,16 @@ fn schedule_auto_update_check(hwnd: HWND) {
     }
 }
 
+/// An empty countdown means no known reset time; the readout needs something
+/// to draw, and the old combined line used to supply the percentage there.
+fn reset_or_dash(text: String) -> String {
+    if text.is_empty() {
+        "--".to_string()
+    } else {
+        text
+    }
+}
+
 fn refresh_usage_texts(state: &mut AppState) {
     if !state.last_poll_ok {
         return;
@@ -706,33 +722,52 @@ fn refresh_usage_texts(state: &mut AppState) {
     };
 
     if let Some(claude_code) = data.claude_code.as_ref() {
-        state.session_text =
-            poller::format_line(&claude_code.session, poller::WindowKind::Session, strings);
-        state.weekly_text =
-            poller::format_line(&claude_code.weekly, poller::WindowKind::Weekly, strings);
+        state.session_text = reset_or_dash(poller::format_reset(
+            &claude_code.session,
+            poller::WindowKind::Session,
+            strings,
+        ));
+        state.weekly_text = reset_or_dash(poller::format_reset(
+            &claude_code.weekly,
+            poller::WindowKind::Weekly,
+            strings,
+        ));
     } else if state.show_claude_code {
         state.session_text = "!".to_string();
         state.weekly_text = "!".to_string();
     }
 
     if let Some(codex) = data.codex.as_ref() {
-        state.codex_session_text =
-            poller::format_line(&codex.session, poller::WindowKind::Session, strings);
-        state.codex_weekly_text =
-            poller::format_line(&codex.weekly, poller::WindowKind::Weekly, strings);
+        state.codex_session_text = reset_or_dash(poller::format_reset(
+            &codex.session,
+            poller::WindowKind::Session,
+            strings,
+        ));
+        state.codex_weekly_text = reset_or_dash(poller::format_reset(
+            &codex.weekly,
+            poller::WindowKind::Weekly,
+            strings,
+        ));
     } else if state.show_codex {
         state.codex_session_text = "!".to_string();
         state.codex_weekly_text = "!".to_string();
     }
 
     if let Some(antigravity) = data.antigravity.as_ref() {
-        state.antigravity_session_text =
-            poller::format_line(&antigravity.session, poller::WindowKind::Session, strings);
+        state.antigravity_session_text = reset_or_dash(poller::format_reset(
+            &antigravity.session,
+            poller::WindowKind::Session,
+            strings,
+        ));
         state.antigravity_weekly_text =
             if antigravity.weekly.resets_at.is_none() && antigravity.weekly.percentage == 0.0 {
                 "--".to_string()
             } else {
-                poller::format_line(&antigravity.weekly, poller::WindowKind::Weekly, strings)
+                reset_or_dash(poller::format_reset(
+                    &antigravity.weekly,
+                    poller::WindowKind::Weekly,
+                    strings,
+                ))
             };
     } else if state.show_antigravity {
         state.antigravity_session_text = "!".to_string();
@@ -1132,18 +1167,23 @@ const PROVIDER_GAP: i32 = 6;
 /// Colour pip identifying a provider, drawn only when more than one is shown.
 const PIP_W: i32 = 8;
 
-/// Row origins and the offsets within a row. Everything below the weekly rule
-/// is the day band, which is why the rows sit higher than centred: seven
-/// weekday initials need seven pixels under the second gauge.
-const ROW1_Y: i32 = 6;
-const ROW2_Y: i32 = 22;
-const ROW_H: i32 = 16;
-const FIGURE_W: i32 = 34;
-const TIME_DX: i32 = 36;
+/// Row origins and the offsets within a row.
+///
+/// The 46px budget is spent deliberately, because it does not stretch: the
+/// freshness hairline takes the top row, then two 14px figure bands each with a
+/// gauge two pixels under them, then a ten-pixel day band that reaches the
+/// bottom edge. DrawTextW centres a font's whole line box, not its cap height,
+/// so a band has to clear roughly the point size or the glyphs get cut - which
+/// is what a seven-pixel band did to the weekday initials.
+const ROW1_Y: i32 = 2;
+const ROW2_Y: i32 = 19;
+const ROW_H: i32 = 14;
+const FIGURE_W: i32 = 38;
+const TIME_DX: i32 = 40;
 const RULE_DY: i32 = 15;
 const RULE_W: i32 = 72;
 const DAY_DY: i32 = 17;
-const DAY_BAND_H: i32 = 7;
+const DAY_BAND_H: i32 = 10;
 
 /// Blocks in the weekly window, one per day.
 const WEEKLY_BLOCKS: i32 = 7;
@@ -2337,7 +2377,7 @@ fn paint_content(
             breath,
         );
 
-        let figure_font = make_font(-15, FW_SEMIBOLD);
+        let figure_font = make_font(-14, FW_SEMIBOLD);
         let time_font = make_font(-10, FW_MEDIUM);
         let day_font = make_font(-9, FW_SEMIBOLD);
         let day_font_bold = make_font(-9, FW_BOLD);
@@ -2433,15 +2473,16 @@ fn paint_content(
         let _ = DeleteObject(day_font);
         let _ = DeleteObject(day_font_bold);
 
-        // Poll freshness: a hairline along the bottom edge that fills over the
-        // poll interval and restarts when a reading lands. It is always moving,
-        // it says how stale the figures above it are, and it puts your eye on
-        // the row a moment before the count-up fires.
+        // Poll freshness: a hairline along the top edge that fills over the poll
+        // interval and restarts when a reading lands. It is always moving, it
+        // says how stale the figures below it are, and it puts your eye on the
+        // row a moment before the count-up fires. It sits at the top because
+        // the bottom of the widget belongs to the day band.
         let thin = sc(1).max(1);
         let x0 = sc(CONTENT_X);
         let x1 = width - thin;
         if x1 > x0 {
-            let y = height - thin;
+            let y = 0;
             fill_box(hdc, x0, y, x1 - x0, thin, &blend(*bg, *text_color, 0.18));
             let filled = (((x1 - x0) as f64) * frame.poll_frac).round() as i32;
             fill_box(hdc, x0, y, filled, thin, &blend(*bg, *text_color, 0.45));
@@ -4151,9 +4192,9 @@ fn draw_numeric_row(
             fill_box(
                 hdc,
                 o.x + pace_x,
-                ry - sc(2),
+                ry - thin,
                 thin,
-                sc(4),
+                thin * 3,
                 &blend(pace_marker_color(o.is_dark), o.bg, 0.35),
             );
         }
