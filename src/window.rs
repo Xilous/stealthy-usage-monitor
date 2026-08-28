@@ -154,12 +154,6 @@ static SUPPRESS_TRAY_REPOSITION_UNTIL: Mutex<Option<Instant>> = Mutex::new(None)
 /// Current system DPI (96 = 100% scaling, 144 = 150%, 192 = 200%, etc.)
 static CURRENT_DPI: AtomicU32 = AtomicU32::new(96);
 
-/// Whole-number RAM percentage most recently painted. The RAM timer compares
-/// the live reading against this and only repaints when it differs, so a stable
-/// system does not churn the widget every tick. `u32::MAX` is the "never
-/// painted" sentinel, which always looks like a change on the first tick.
-static LAST_RAM_PERCENT: AtomicU32 = AtomicU32::new(u32::MAX);
-
 /// Scale a base pixel value (designed at 96 DPI) to the current DPI.
 fn sc(px: i32) -> i32 {
     let dpi = CURRENT_DPI.load(Ordering::Relaxed);
@@ -1117,53 +1111,50 @@ fn set_startup_enabled(enable: bool) {
     }
 }
 
-// Dimensions matching the C# version. SEGMENT_W/SEGMENT_GAP/SEGMENT_COUNT no
-// longer describe what is drawn - they only define the overall bar width, which
-// stays fixed so both rows and their trailing text line up. How that width is
-// subdivided is per-row: the session bar is one continuous block, the weekly bar
-// is split into one block per day of the window.
-const SEGMENT_W: i32 = 10;
-const SEGMENT_H: i32 = 13;
-const SEGMENT_GAP: i32 = 1;
-const SEGMENT_COUNT: i32 = 10;
-const CORNER_RADIUS: i32 = 2;
+// Numeric layout. Each provider gets two rows - the five-hour window above
+// the weekly one - and a row is a percentage figure, a time-to-reset, and a
+// one-pixel hairline gauge beneath them. There are no bars, row labels or ring
+// any more: the figure carries the reading and the hairline carries its shape,
+// which is what lets one provider fit in 114px instead of 298.
+const WIDGET_HEIGHT: i32 = 46;
+const LEFT_DIVIDER_W: i32 = 3;
 
-/// Blocks in the session bar: one continuous fill, no internal dividers.
-const SESSION_BLOCKS: i32 = 1;
-/// Blocks in the weekly bar, one per day of the 7-day window.
+/// Device RAM: a narrow column between the drag handle and the figures.
+const RAM_X: i32 = 13;
+const RAM_Y: i32 = 9;
+const RAM_W: i32 = 5;
+const RAM_H: i32 = 28;
+
+/// Where the first provider's figures start, and what each provider occupies.
+const CONTENT_X: i32 = 28;
+const PROVIDER_W: i32 = 86;
+const PROVIDER_GAP: i32 = 6;
+/// Colour pip identifying a provider, drawn only when more than one is shown.
+const PIP_W: i32 = 8;
+
+/// Row origins and the offsets within a row. Everything below the weekly rule
+/// is the day band, which is why the rows sit higher than centred: seven
+/// weekday initials need seven pixels under the second gauge.
+const ROW1_Y: i32 = 6;
+const ROW2_Y: i32 = 22;
+const ROW_H: i32 = 16;
+const FIGURE_W: i32 = 34;
+const TIME_DX: i32 = 36;
+const RULE_DY: i32 = 15;
+const RULE_W: i32 = 72;
+const DAY_DY: i32 = 17;
+const DAY_BAND_H: i32 = 7;
+
+/// Blocks in the weekly window, one per day.
 const WEEKLY_BLOCKS: i32 = 7;
 
-const LEFT_DIVIDER_W: i32 = 3;
-const DIVIDER_RIGHT_MARGIN: i32 = 10;
-const LABEL_WIDTH: i32 = 18;
-const LABEL_RIGHT_MARGIN: i32 = 10;
-const BAR_RIGHT_MARGIN: i32 = 4;
-const TEXT_WIDTH: i32 = 88;
-const MODEL_RIGHT_MARGIN: i32 = 3;
-const RIGHT_MARGIN: i32 = 1;
-const WIDGET_HEIGHT: i32 = 46;
-
-// RAM section, drawn on the left between the drag handle and the model bars:
-// a circular "ember ring" gauge whose arc fills clockwise to the RAM percent,
-// with the exact "NN%" centred inside it and a bright bead riding the arc head,
-// then a thin divider before the model content.
-const RING_D: i32 = 36;
-const RING_STROKE: i32 = 4;
-const RING_RIGHT_MARGIN: i32 = 8;
-const RAM_DIVIDER_W: i32 = 1;
-const RAM_DIVIDER_RIGHT_MARGIN: i32 = 10;
-
-/// How often the live RAM reading is sampled. A repaint only happens when the
-/// whole-number percentage changes, so this cadence is cheap on a stable system.
+/// How often the live RAM reading is sampled. The paint eases toward whatever
+/// this last stored, so the column drifts continuously between samples.
 const RAM_REFRESH_MS: u32 = 2000;
 
-/// Ambient-animation cadence (~30fps). Drives the breathing LED glow and the
-/// RAM ring so the widget looks alive even while the underlying numbers, which
-/// only move over tens of minutes, are effectively static.
+/// Ambient-animation cadence (~30fps). Drives the breath, the settling
+/// figures, the RAM drift and the poll-freshness hairline.
 const ANIM_REFRESH_MS: u32 = 33;
-
-/// How far the pace marker needle extends above and below the bar.
-const PACE_MARKER_OVERHANG: i32 = 2;
 
 const SESSION_WINDOW: Duration = Duration::from_secs(5 * 60 * 60);
 const WEEKLY_WINDOW: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -1316,46 +1307,49 @@ fn active_model_count(show_claude_code: bool, show_codex: bool, show_antigravity
 /// clears a glyph at the full segment count: the old narrower bars for two and
 /// three models left blocks about seven and five pixels wide, where nothing
 /// legible fits. The widget is wider for it.
-fn row_bar_segment_count(_active_models: i32) -> i32 {
-    SEGMENT_COUNT
-}
-
-/// Live physical-memory load as a whole-number percentage (0-100). Uses
-/// GlobalMemoryStatusEx, whose dwMemoryLoad field is already "percent of
-/// physical RAM in use", so no arithmetic is needed. Returns 0 if the call
-/// fails, which just draws an empty bar rather than crashing the paint.
-fn current_ram_percent() -> u32 {
+/// Live physical-memory load as a percentage, with the fraction kept.
+/// `dwMemoryLoad` is only ever a whole number, so a steady machine looks frozen
+/// through it; the byte counters move continuously, which is what lets the
+/// column drift instead of sitting still between whole-percent steps.
+fn current_ram_percent() -> f64 {
     unsafe {
         let mut status = MEMORYSTATUSEX {
             dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
             ..Default::default()
         };
-        if GlobalMemoryStatusEx(&mut status).is_ok() {
-            status.dwMemoryLoad.min(100)
+        if GlobalMemoryStatusEx(&mut status).is_ok() && status.ullTotalPhys > 0 {
+            let used = status.ullTotalPhys.saturating_sub(status.ullAvailPhys) as f64;
+            (used / status.ullTotalPhys as f64 * 100.0).clamp(0.0, 100.0)
         } else {
-            0
+            0.0
         }
     }
 }
 
-/// Total horizontal space the RAM section occupies: the ring gauge, its right
-/// margin, the divider, and the divider margin. The percentage lives inside the
-/// ring, so there is no separate text column.
-fn ram_section_width() -> i32 {
-    sc(RING_D) + sc(RING_RIGHT_MARGIN) + sc(RAM_DIVIDER_W) + sc(RAM_DIVIDER_RIGHT_MARGIN)
+/// Most recent RAM sample in hundredths of a percent, written by the RAM timer
+/// and eased toward by every paint.
+static RAM_SAMPLE: AtomicU32 = AtomicU32::new(u32::MAX);
+
+fn sample_ram() {
+    RAM_SAMPLE.store((current_ram_percent() * 100.0).round() as u32, Ordering::Relaxed);
+}
+
+fn last_ram_sample() -> f64 {
+    match RAM_SAMPLE.load(Ordering::Relaxed) {
+        u32::MAX => {
+            sample_ram();
+            current_ram_percent()
+        }
+        v => v as f64 / 100.0,
+    }
+}
+
+fn provider_slot_width() -> i32 {
+    sc(PROVIDER_W) + sc(PROVIDER_GAP)
 }
 
 fn total_widget_width_for(active_models: i32) -> i32 {
-    let model_width = model_usage_width(row_bar_segment_count(active_models));
-
-    sc(LEFT_DIVIDER_W)
-        + sc(DIVIDER_RIGHT_MARGIN)
-        + ram_section_width()
-        + sc(LABEL_WIDTH)
-        + sc(LABEL_RIGHT_MARGIN)
-        + model_width * active_models
-        + sc(MODEL_RIGHT_MARGIN) * (active_models - 1)
-        + sc(RIGHT_MARGIN)
+    sc(CONTENT_X) + provider_slot_width() * active_models - sc(PROVIDER_GAP)
 }
 
 fn total_widget_width_for_state(state: &AppState) -> i32 {
@@ -1456,21 +1450,68 @@ fn ring_led() -> Led {
     }
 }
 
+/// Semantic ramps, kept deliberately separate from provider identity: these
+/// say how much trouble a window is in, not which product it belongs to.
+fn warm_led() -> Led {
+    Led {
+        edge: Color::from_hex("#92400E"),
+        mid: Color::from_hex("#FBBF24"),
+        core: Color::from_hex("#FFF8E3"),
+        glow: Color::from_hex("#F59E0B"),
+    }
+}
+
+fn hot_led() -> Led {
+    Led {
+        edge: Color::from_hex("#7F1D1D"),
+        mid: Color::from_hex("#F87171"),
+        core: Color::from_hex("#FFE6E6"),
+        glow: Color::from_hex("#EF4444"),
+    }
+}
+
+fn lerp_led(a: &Led, b: &Led, t: f64) -> Led {
+    Led {
+        edge: blend(a.edge, b.edge, t),
+        mid: blend(a.mid, b.mid, t),
+        core: blend(a.core, b.core, t),
+        glow: blend(a.glow, b.glow, t),
+    }
+}
+
+/// How a usage row is coloured. `burn` is how far ahead of an even spend the
+/// reading is, so a window that will run out early goes warm well before it is
+/// numerically high - which is the whole point of showing pace at all.
+fn state_led(percent: f64, burn: f64, base: &Led) -> Led {
+    if percent >= 90.0 || burn >= 18.0 {
+        hot_led()
+    } else if percent >= 70.0 || burn >= 8.0 {
+        warm_led()
+    } else {
+        *base
+    }
+}
+
+/// RAM warms continuously rather than in steps, so the colour itself reads as
+/// headroom: emerald while there is room, amber as it tightens, red as the
+/// machine approaches swapping.
+fn ram_led(percent: f64) -> Led {
+    let ring = ring_led();
+    if percent <= 60.0 {
+        ring
+    } else if percent <= 85.0 {
+        lerp_led(&ring, &warm_led(), (percent - 60.0) / 25.0)
+    } else {
+        lerp_led(&warm_led(), &hot_led(), ((percent - 85.0) / 15.0).clamp(0.0, 1.0))
+    }
+}
+
 /// Track colour for the unfilled part of the RAM ring.
 fn ram_track_color(is_dark: bool) -> Color {
     if is_dark {
         Color::from_hex("#2F3B45")
     } else {
         Color::from_hex("#C7D2DA")
-    }
-}
-
-/// Colour of the "NN%" readout centred inside the ring.
-fn ram_number_color(is_dark: bool) -> Color {
-    if is_dark {
-        Color::from_hex("#BFE9D6")
-    } else {
-        Color::from_hex("#0F7A52")
     }
 }
 
@@ -1502,49 +1543,136 @@ fn anim_breath() -> f64 {
     s * s * (3.0 - 2.0 * s)
 }
 
-/// Relative luminance, 0..1. Decides whether a weekday letter needs dark or
-/// light ink to hold up against a given LED.
-fn luminance(c: Color) -> f64 {
-    (0.2126 * c.r as f64 + 0.7152 * c.g as f64 + 0.0722 * c.b as f64) / 255.0
+/// Ink for the weekday initials. One colour in every block, lit or not: a
+/// letter that changed colour at the fill edge read as an artefact rather than
+/// as a scale, and the whole point of the initials is that the seven of them are
+/// one row you can scan.
+/// Frame-to-frame animation the paint owns.
+///
+/// The displayed figures ease toward whatever the poller last reported, so a
+/// new reading reads as a change rather than appearing to have always been
+/// there. `flash` decays after each poll, `text_tick` fires when a countdown
+/// digit rolls over, and `ram` eases toward the last sample so a steady machine
+/// still drifts. All of it is driven off the existing 33ms animation timer.
+struct LiveAnim {
+    shown: [f64; 6],
+    ram: f64,
+    ram_lo: f64,
+    ram_hi: f64,
+    flash: f64,
+    text_tick: f64,
+    last_texts: [String; 6],
+    last_poll: Option<Instant>,
+    last_step: Option<Instant>,
 }
 
-/// Ink for a weekday letter standing on the lit part of a bar.
-///
-/// The fill is a moving target: draw_led_fill sweeps its centre row from a dim,
-/// veiled body colour at the bottom of the breath to a near-white core at the
-/// top, and the letters sit on exactly that centre row. Only an ink at one
-/// extreme clears a contrast threshold against both ends of that sweep, so this
-/// picks the extreme the LED is not - near-black against a bright palette,
-/// near-white against a dark one - and goes all the way there rather than
-/// splitting the difference.
-fn day_ink_on_fill(led: &Led) -> Color {
-    if luminance(led.mid) > 0.45 {
-        blend(led.edge, Color::from_hex("#01070C"), 0.80)
-    } else {
-        blend(led.mid, Color::from_hex("#FFFFFF"), 0.86)
+#[derive(Clone, Copy)]
+struct LiveFrame {
+    shown: [f64; 6],
+    ram: f64,
+    ram_lo: f64,
+    ram_hi: f64,
+    flash: f64,
+    text_tick: f64,
+    poll_frac: f64,
+}
+
+static LIVE_ANIM: Mutex<Option<LiveAnim>> = Mutex::new(None);
+
+/// Advance the animation one frame and hand back the values to draw with.
+fn step_anim(
+    targets: &[f64; 6],
+    texts: &[&str; 6],
+    ram_target: f64,
+    poll_interval_ms: u32,
+) -> LiveFrame {
+    let mut guard = LIVE_ANIM.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    let anim = guard.get_or_insert_with(|| LiveAnim {
+        shown: *targets,
+        ram: ram_target,
+        ram_lo: ram_target,
+        ram_hi: ram_target,
+        flash: 0.0,
+        text_tick: 0.0,
+        last_texts: std::array::from_fn(|_| String::new()),
+        last_poll: Some(now),
+        last_step: Some(now),
+    });
+
+    // Clamped so a widget that was hidden for an hour does not jump on the
+    // first frame back.
+    let dt = anim
+        .last_step
+        .map(|t| now.duration_since(t).as_secs_f64())
+        .unwrap_or(0.033)
+        .clamp(0.0, 0.5);
+    anim.last_step = Some(now);
+
+    // Exponential approach: fast enough to feel like a jump, slow enough to
+    // read as one.
+    let k = 1.0 - (-dt / 0.18).exp();
+    for i in 0..6 {
+        let delta = targets[i] - anim.shown[i];
+        if delta.abs() < 0.02 {
+            anim.shown[i] = targets[i];
+        } else {
+            anim.shown[i] += delta * k;
+        }
+    }
+
+    let rk = 1.0 - (-dt / 0.45).exp();
+    anim.ram += (ram_target - anim.ram) * rk;
+    // A decaying envelope rather than a true window: cheap, and it tracks
+    // roughly the last minute of movement.
+    anim.ram_lo = anim.ram_lo.min(anim.ram);
+    anim.ram_hi = anim.ram_hi.max(anim.ram);
+    let relax = (dt * 0.04).min(1.0);
+    anim.ram_lo += (anim.ram - anim.ram_lo) * relax;
+    anim.ram_hi += (anim.ram - anim.ram_hi) * relax;
+
+    for i in 0..6 {
+        if anim.last_texts[i] != texts[i] {
+            if !anim.last_texts[i].is_empty() {
+                anim.text_tick = 1.0;
+            }
+            anim.last_texts[i] = texts[i].to_string();
+        }
+    }
+
+    anim.flash *= (-dt / 0.28).exp();
+    anim.text_tick *= (-dt / 0.35).exp();
+    if anim.flash < 0.01 {
+        anim.flash = 0.0;
+    }
+    if anim.text_tick < 0.01 {
+        anim.text_tick = 0.0;
+    }
+
+    let window = (poll_interval_ms.max(1) as f64) / 1000.0;
+    let poll_frac = anim
+        .last_poll
+        .map(|t| (now.duration_since(t).as_secs_f64() / window).clamp(0.0, 1.0))
+        .unwrap_or(0.0);
+
+    LiveFrame {
+        shown: anim.shown,
+        ram: anim.ram,
+        ram_lo: anim.ram_lo,
+        ram_hi: anim.ram_hi,
+        flash: anim.flash,
+        text_tick: anim.text_tick,
+        poll_frac,
     }
 }
 
-/// Ink for a weekday letter over bare track.
-///
-/// The LED palettes are tuned to look right as a fill, not to be read against
-/// the track, and some of them (Codex in light mode) run light exactly where the
-/// track is light. So the base is a neutral pushed away from the track's own
-/// lightness, which is the only thing that reliably clears a contrast threshold
-/// on both a light and a dark taskbar; `tint` then pulls it back toward the LED,
-/// which is how today's letter earns its colour without losing legibility.
-fn day_ink_on_track(track: &Color, led: &Led, tint: f64) -> Color {
-    if luminance(*track) > 0.5 {
-        let mut hue = led.edge;
-        if luminance(led.mid) < luminance(hue) {
-            hue = led.mid;
-        }
-        if luminance(led.core) < luminance(hue) {
-            hue = led.core;
-        }
-        blend(blend(*track, Color::from_hex("#101010"), 0.62), hue, tint)
-    } else {
-        blend(blend(*track, Color::from_hex("#FFFFFF"), 0.62), led.glow, tint)
+/// A poll landed: the figures start moving to their new values and the
+/// freshness hairline restarts from the left.
+fn mark_poll() {
+    let mut guard = LIVE_ANIM.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(anim) = guard.as_mut() {
+        anim.flash = 1.0;
+        anim.last_poll = Some(Instant::now());
     }
 }
 
@@ -2119,6 +2247,39 @@ fn paint_content(
     codex_accent: &Color,
     antigravity_accent: &Color,
 ) {
+    let poll_interval_ms = {
+        let state = lock_state();
+        state
+            .as_ref()
+            .map(|s| s.poll_interval_ms)
+            .unwrap_or(POLL_1_MIN)
+    };
+
+    // The bar-era accents and the row-label strings drive nothing now that the
+    // rows are figures; the paint entrypoints still compute and pass them.
+    let _ = (accent, codex_accent, antigravity_accent, track);
+
+    let breath = anim_breath();
+    let multi = active_model_count(show_claude_code, show_codex, show_antigravity) > 1;
+
+    let targets = [
+        session_pct,
+        weekly_pct,
+        codex_session_pct,
+        codex_weekly_pct,
+        antigravity_session_pct,
+        antigravity_weekly_pct,
+    ];
+    let texts = [
+        session_text,
+        weekly_text,
+        codex_session_text,
+        codex_weekly_text,
+        antigravity_session_text,
+        antigravity_weekly_text,
+    ];
+    let frame = step_anim(&targets, &texts, last_ram_sample(), poll_interval_ms);
+
     unsafe {
         let client_rect = RECT {
             left: 0,
@@ -2126,22 +2287,18 @@ fn paint_content(
             right: width,
             bottom: height,
         };
-
         let bg_brush = CreateSolidBrush(COLORREF(bg.to_colorref()));
         FillRect(hdc, &client_rect, bg_brush);
         let _ = DeleteObject(bg_brush);
 
-        // Left divider
+        // Drag handle, unchanged: two hairlines the width of the grab area.
         let divider_h = sc(25);
         let divider_top = (height - divider_h) / 2;
-        let divider_bottom = divider_top + divider_h;
-
         let (div_left, div_right) = if is_dark {
             ((80, 80, 80), (40, 40, 40))
         } else {
             ((160, 160, 160), (230, 230, 230))
         };
-
         let left_brush = CreateSolidBrush(COLORREF(native_interop::colorref(
             div_left.0, div_left.1, div_left.2,
         )));
@@ -2149,11 +2306,10 @@ fn paint_content(
             left: 0,
             top: divider_top,
             right: sc(2),
-            bottom: divider_bottom,
+            bottom: divider_top + divider_h,
         };
         FillRect(hdc, &left_rect, left_brush);
         let _ = DeleteObject(left_brush);
-
         let right_brush = CreateSolidBrush(COLORREF(native_interop::colorref(
             div_right.0,
             div_right.1,
@@ -2163,100 +2319,133 @@ fn paint_content(
             left: sc(2),
             top: divider_top,
             right: sc(3),
-            bottom: divider_bottom,
+            bottom: divider_top + divider_h,
         };
         FillRect(hdc, &right_rect, right_brush);
         let _ = DeleteObject(right_brush);
 
-        // The RAM section sits between the drag handle and the model bars; the
-        // model content starts after it.
-        let ram_x = sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN);
-        let content_x = ram_x + ram_section_width();
-        let row2_y = height - sc(5) - sc(SEGMENT_H);
-        let row1_y = row2_y - sc(10) - sc(SEGMENT_H);
-
         let _ = SetBkMode(hdc, TRANSPARENT);
-        let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
 
-        let font_name = native_interop::wide_str("Segoe UI");
-        let font = CreateFontW(
-            sc(-12),
-            0,
-            0,
-            0,
-            FW_MEDIUM.0 as i32,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET.0 as u32,
-            OUT_TT_PRECIS.0 as u32,
-            CLIP_DEFAULT_PRECIS.0 as u32,
-            CLEARTYPE_QUALITY.0 as u32,
-            (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
-            PCWSTR::from_raw(font_name.as_ptr()),
-        );
-        let old_font = SelectObject(hdc, font);
-
-        // The model accents no longer drive the fills (the bars are LED
-        // gradients now), but the paint entrypoints still compute and pass them.
-        let _ = (accent, codex_accent, antigravity_accent);
-
-        // Device RAM: a circular ring gauge with the percentage centred inside.
-        // Sampled live at paint time; record what we drew so the RAM timer can
-        // tell when it changed.
-        let ram_percent = current_ram_percent();
-        LAST_RAM_PERCENT.store(ram_percent, Ordering::Relaxed);
-        draw_ram_ring(hdc, ram_x, height, ram_percent, is_dark, bg);
-
-        draw_row(
+        draw_ram_column(
             hdc,
-            content_x,
-            row1_y,
+            sc(RAM_X),
+            frame.ram,
+            frame.ram_lo,
+            frame.ram_hi,
             is_dark,
-            text_color,
-            strings.session_window,
-            &strings.weekday_initials,
-            SESSION_BLOCKS,
-            None,
-            session_pct,
-            session_pace,
-            session_text,
-            codex_session_pct,
-            codex_session_text,
-            antigravity_session_pct,
-            antigravity_session_text,
-            show_claude_code,
-            show_codex,
-            show_antigravity,
-            track,
             bg,
+            breath,
         );
-        draw_row(
-            hdc,
-            content_x,
-            row2_y,
-            is_dark,
-            text_color,
-            strings.weekly_window,
-            &strings.weekday_initials,
-            WEEKLY_BLOCKS,
-            Some(week),
-            weekly_pct,
-            weekly_pace,
-            weekly_text,
-            codex_weekly_pct,
-            codex_weekly_text,
-            antigravity_weekly_pct,
-            antigravity_weekly_text,
-            show_claude_code,
-            show_codex,
-            show_antigravity,
-            track,
-            bg,
-        );
+
+        let figure_font = make_font(-15, FW_SEMIBOLD);
+        let time_font = make_font(-10, FW_MEDIUM);
+        let day_font = make_font(-9, FW_SEMIBOLD);
+        let day_font_bold = make_font(-9, FW_BOLD);
+        let old_font = SelectObject(hdc, figure_font);
+
+        let providers = [
+            (
+                show_claude_code,
+                claude_led(),
+                0usize,
+                claude_usage_text_color(is_dark),
+                week.claude,
+            ),
+            (
+                show_codex,
+                codex_led(is_dark),
+                2usize,
+                codex_usage_text_color(is_dark),
+                week.codex,
+            ),
+            (
+                show_antigravity,
+                antigravity_led(),
+                4usize,
+                antigravity_usage_text_color(is_dark),
+                week.antigravity,
+            ),
+        ];
+
+        let mut x = sc(CONTENT_X);
+        for (visible, base, idx, ident_color, blocks) in providers {
+            if !visible {
+                continue;
+            }
+            let tx = if multi { x + sc(PIP_W) } else { x };
+            let ink = if multi { ident_color } else { *text_color };
+
+            if multi {
+                // Identity pip: square and small, so it cannot be mistaken for
+                // the RAM column, which is the only gauge drawn as a bar.
+                let pip = sc(3).max(2);
+                for row_y in [sc(ROW1_Y), sc(ROW2_Y)] {
+                    fill_box(hdc, x, row_y + sc(ROW_H) / 2 - pip / 2, pip, pip, &base.mid);
+                }
+            }
+
+            let rows = [
+                (
+                    sc(ROW1_Y),
+                    idx,
+                    if idx == 0 { session_pace } else { None },
+                    None,
+                ),
+                (
+                    sc(ROW2_Y),
+                    idx + 1,
+                    if idx == 0 { weekly_pace } else { None },
+                    blocks,
+                ),
+            ];
+            for (row_y, slot, pace, week_blocks) in rows {
+                draw_numeric_row(
+                    hdc,
+                    &RowDraw {
+                        x: tx,
+                        y: row_y,
+                        shown: frame.shown[slot],
+                        pace,
+                        time_text: texts[slot],
+                        base,
+                        week: week_blocks,
+                        weekdays: &strings.weekday_initials,
+                        is_dark,
+                        bg: *bg,
+                        track: *track,
+                        ink,
+                        breath,
+                        flash: frame.flash,
+                        text_tick: frame.text_tick,
+                    },
+                    figure_font,
+                    time_font,
+                    day_font,
+                    day_font_bold,
+                );
+            }
+            x += provider_slot_width();
+        }
 
         SelectObject(hdc, old_font);
-        let _ = DeleteObject(font);
+        let _ = DeleteObject(figure_font);
+        let _ = DeleteObject(time_font);
+        let _ = DeleteObject(day_font);
+        let _ = DeleteObject(day_font_bold);
+
+        // Poll freshness: a hairline along the bottom edge that fills over the
+        // poll interval and restarts when a reading lands. It is always moving,
+        // it says how stale the figures above it are, and it puts your eye on
+        // the row a moment before the count-up fires.
+        let thin = sc(1).max(1);
+        let x0 = sc(CONTENT_X);
+        let x1 = width - thin;
+        if x1 > x0 {
+            let y = height - thin;
+            fill_box(hdc, x0, y, x1 - x0, thin, &blend(*bg, *text_color, 0.18));
+            let filled = (((x1 - x0) as f64) * frame.poll_frac).round() as i32;
+            fill_box(hdc, x0, y, filled, thin, &blend(*bg, *text_color, 0.45));
+        }
     }
 }
 
@@ -2825,17 +3014,15 @@ unsafe extern "system" fn wnd_proc(
                     schedule_countdown_timer();
                 }
                 TIMER_RAM => {
-                    // Only repaint when the displayed percentage actually
-                    // changes, and skip the work entirely while the widget is
-                    // hidden.
+                    // Sample only. TIMER_ANIM already repaints at ~30fps and
+                    // the paint eases toward this value, so the column drifts
+                    // continuously instead of stepping on whole percents.
                     let visible = {
                         let state = lock_state();
                         state.as_ref().map(|s| s.widget_visible).unwrap_or(false)
                     };
-                    if visible
-                        && current_ram_percent() != LAST_RAM_PERCENT.load(Ordering::Relaxed)
-                    {
-                        render_layered();
+                    if visible {
+                        sample_ram();
                     }
                 }
                 TIMER_ANIM => {
@@ -2907,6 +3094,7 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_APP_USAGE_UPDATED => {
+            mark_poll();
             check_theme_change();
             check_language_change();
             render_layered();
@@ -3713,272 +3901,30 @@ fn paint(hdc: HDC, hwnd: HWND) {
     }
 }
 
-fn draw_row(
-    hdc: HDC,
-    x: i32,
-    y: i32,
-    is_dark: bool,
-    text_color: &Color,
-    label: &str,
-    weekdays: &[&'static str; 7],
-    blocks: i32,
-    week: Option<WeekMarkers>,
-    claude_percent: f64,
-    claude_pace: Option<f64>,
-    claude_text: &str,
-    codex_percent: f64,
-    codex_text: &str,
-    antigravity_percent: f64,
-    antigravity_text: &str,
-    show_claude_code: bool,
-    show_codex: bool,
-    show_antigravity: bool,
-    track: &Color,
-    bg: &Color,
-) {
-    let seg_h = sc(SEGMENT_H);
-    let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
-    let segment_count = row_bar_segment_count(active_models);
-    let use_model_text_colors = active_models > 1;
-    let claude_value_color = if use_model_text_colors {
-        claude_usage_text_color(is_dark)
-    } else {
-        *text_color
-    };
-    let codex_value_color = if use_model_text_colors {
-        codex_usage_text_color(is_dark)
-    } else {
-        *text_color
-    };
-    let antigravity_value_color = if use_model_text_colors {
-        antigravity_usage_text_color(is_dark)
-    } else {
-        *text_color
-    };
-
+/// Fill a plain rectangle. Most of the numeric layout is one- and two-pixel
+/// boxes, which do not want the rounded-rect machinery.
+fn fill_box(hdc: HDC, x: i32, y: i32, w: i32, h: i32, color: &Color) {
+    if w <= 0 || h <= 0 {
+        return;
+    }
     unsafe {
-        let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
-        let mut label_wide: Vec<u16> = label.encode_utf16().collect();
-        let mut label_rect = RECT {
+        let brush = CreateSolidBrush(COLORREF(color.to_colorref()));
+        let rect = RECT {
             left: x,
             top: y,
-            right: x + sc(LABEL_WIDTH),
-            bottom: y + seg_h,
+            right: x + w,
+            bottom: y + h,
         };
-        let _ = DrawTextW(
-            hdc,
-            &mut label_wide,
-            &mut label_rect,
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
-        );
-
-        let mut model_x = x + sc(LABEL_WIDTH) + sc(LABEL_RIGHT_MARGIN);
-        if show_claude_code {
-            draw_usage_bar(
-                hdc,
-                model_x,
-                y,
-                segment_count,
-                blocks,
-                week.and_then(|w| w.claude),
-                weekdays,
-                claude_percent,
-                claude_pace,
-                claude_text,
-                &claude_led(),
-                track,
-                &claude_value_color,
-                is_dark,
-                bg,
-            );
-            model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
-        }
-        if show_codex {
-            draw_usage_bar(
-                hdc,
-                model_x,
-                y,
-                segment_count,
-                blocks,
-                week.and_then(|w| w.codex),
-                weekdays,
-                codex_percent,
-                None,
-                codex_text,
-                &codex_led(is_dark),
-                track,
-                &codex_value_color,
-                is_dark,
-                bg,
-            );
-            model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
-        }
-        if show_antigravity {
-            draw_usage_bar(
-                hdc,
-                model_x,
-                y,
-                segment_count,
-                blocks,
-                week.and_then(|w| w.antigravity),
-                weekdays,
-                antigravity_percent,
-                None,
-                antigravity_text,
-                &antigravity_led(),
-                track,
-                &antigravity_value_color,
-                is_dark,
-                bg,
-            );
-        }
+        FillRect(hdc, &rect, brush);
+        let _ = DeleteObject(brush);
     }
 }
 
-fn model_usage_width(segment_count: i32) -> i32 {
-    bar_total_width(segment_count) + sc(BAR_RIGHT_MARGIN) + sc(TEXT_WIDTH)
-}
-
-/// Overall pixel width of one usage bar, independent of how many blocks it is
-/// drawn as.
-fn bar_total_width(segment_count: i32) -> i32 {
-    (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * segment_count - sc(SEGMENT_GAP)
-}
-
-/// Left and right edge of block `index` of `blocks`, as offsets from the bar's
-/// left edge. Blocks tile the full bar width with `gap` between them, and the
-/// leftover pixels from an uneven division are spread out rather than dumped on
-/// the last block.
-fn block_bounds(bar_w: i32, blocks: i32, gap: i32, index: i32) -> (i32, i32) {
-    if blocks <= 1 {
-        return (0, bar_w);
-    }
-    let fillable = (bar_w - gap * (blocks - 1)).max(0) as f64;
-    let edge = |i: i32| (fillable * i as f64 / blocks as f64).round() as i32 + i * gap;
-    (edge(index), edge(index + 1) - gap)
-}
-
-fn draw_usage_bar(
-    hdc: HDC,
-    bar_x: i32,
-    y: i32,
-    segment_count: i32,
-    blocks: i32,
-    week: Option<WeekBlocks>,
-    weekdays: &[&'static str; 7],
-    percent: f64,
-    pace: Option<f64>,
-    text: &str,
-    led: &Led,
-    track: &Color,
-    text_color: &Color,
-    is_dark: bool,
-    bg: &Color,
-) {
-    let seg_h = sc(SEGMENT_H);
-    let corner_r = sc(CORNER_RADIUS);
-    let bar_w = bar_total_width(segment_count);
-    let blocks = blocks.max(1);
-    let breath = anim_breath();
-
-    unsafe {
-        let percent = percent.clamp(0.0, 100.0);
-
-        // Track behind the fill.
-        let track_rect = RECT {
-            left: bar_x,
-            top: y,
-            right: bar_x + bar_w,
-            bottom: y + seg_h,
-        };
-        draw_rounded_rect(hdc, &track_rect, track, corner_r);
-
-        // The LED fill: one continuous glowing gradient up to `percent`, with a
-        // breathing soft halo behind it. The fill edge itself is the level.
-        let fill_w = ((bar_w as f64) * percent / 100.0).round() as i32;
-        if fill_w > 0 {
-            let fill_rect = RECT {
-                left: bar_x,
-                top: y,
-                right: bar_x + fill_w,
-                bottom: y + seg_h,
-            };
-            draw_led_glow(hdc, &fill_rect, &led.glow, bg, breath, corner_r);
-            draw_led_fill(hdc, &fill_rect, led, breath, corner_r);
-        }
-
-        // Day dividers for the weekly bar: thin background-coloured gaps that
-        // split the continuous fill into one block per day.
-        if blocks > 1 {
-            let brush = CreateSolidBrush(COLORREF(bg.to_colorref()));
-            for i in 1..blocks {
-                let (_, prev_right) = block_bounds(bar_w, blocks, sc(SEGMENT_GAP), i - 1);
-                let (next_left, _) = block_bounds(bar_w, blocks, sc(SEGMENT_GAP), i);
-                let gap_rect = RECT {
-                    left: bar_x + prev_right,
-                    top: y - sc(1),
-                    right: bar_x + next_left,
-                    bottom: y + seg_h + sc(1),
-                };
-                FillRect(hdc, &gap_rect, brush);
-            }
-            let _ = DeleteObject(brush);
-        }
-
-        // Pace marker: a thin needle at the position usage "should" be at if
-        // it burned evenly across the window. Bar ahead of the needle means
-        // slow down; bar behind it means there is headroom.
-        if let Some(pace) = pace {
-            let pace = pace.clamp(0.0, 100.0);
-            let marker_w = sc(1).max(1);
-            let marker_x = bar_x + (((bar_w - marker_w) as f64) * pace / 100.0).round() as i32;
-            let overhang = sc(PACE_MARKER_OVERHANG);
-            let marker_rect = RECT {
-                left: marker_x,
-                top: y - overhang,
-                right: marker_x + marker_w,
-                bottom: y + seg_h + overhang,
-            };
-            let needle = blend(pace_marker_color(is_dark), *bg, 0.45);
-            let brush = CreateSolidBrush(COLORREF(needle.to_colorref()));
-            FillRect(hdc, &marker_rect, brush);
-            let _ = DeleteObject(brush);
-        }
-
-        // Weekday initials go on last so neither a day divider nor the pace
-        // needle ever cuts a letter in half.
-        if let Some(week) = week {
-            draw_day_letters(
-                hdc, bar_x, y, bar_w, fill_w, &week, weekdays, led, track, bg, breath,
-            );
-        }
-
-        let text_x = bar_x + bar_w + sc(BAR_RIGHT_MARGIN);
-        let mut text_wide: Vec<u16> = text.encode_utf16().collect();
-        let mut text_rect = RECT {
-            left: text_x,
-            top: y,
-            right: text_x + sc(TEXT_WIDTH),
-            bottom: y + seg_h,
-        };
-        let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
-        let _ = DrawTextW(
-            hdc,
-            &mut text_wide,
-            &mut text_rect,
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
-        );
-    }
-}
-
-/// Font for the in-bar weekday initials. Small enough that a two-character
-/// abbreviation still clears the narrowest block, heavy enough to survive being
-/// drawn on top of a glowing gradient.
-fn day_font(weight: FONT_WEIGHT) -> HFONT {
+fn make_font(px: i32, weight: FONT_WEIGHT) -> HFONT {
     let name = native_interop::wide_str("Segoe UI");
     unsafe {
         CreateFontW(
-            sc(-10),
+            sc(px),
             0,
             0,
             0,
@@ -3996,248 +3942,270 @@ fn day_font(weight: FONT_WEIGHT) -> HFONT {
     }
 }
 
-/// Draw a short label centred in `cell`, nudged by (dx, dy). Used both for the
-/// glyph itself and for the offset copies that make up today's bloom.
-fn draw_centered(hdc: HDC, cell: &RECT, label: &str, dx: i32, dy: i32) {
-    let mut wide: Vec<u16> = label.encode_utf16().collect();
-    let mut r = RECT {
-        left: cell.left + dx,
-        top: cell.top + dy,
-        right: cell.right + dx,
-        bottom: cell.bottom + dy,
-    };
+fn draw_text_in(hdc: HDC, rect: RECT, text: &str, color: &Color, format: DRAW_TEXT_FORMAT) {
+    let mut wide: Vec<u16> = text.encode_utf16().collect();
+    let mut r = rect;
     unsafe {
-        let _ = DrawTextW(hdc, &mut wide, &mut r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        let _ = SetTextColor(hdc, COLORREF(color.to_colorref()));
+        let _ = DrawTextW(hdc, &mut wide, &mut r, format);
     }
 }
 
-/// Stamp the weekday initials into the weekly bar's seven blocks.
+/// The device-RAM column.
 ///
-/// Each letter is drawn twice under complementary clips - once over the lit
-/// fill in dark ink, once over the bare track in a dimmed LED tint - so a letter
-/// straddling the fill edge stays readable on both sides of it. Today's block
-/// gets the loud treatment: a breathing wash behind it, bold weight, a bloom
-/// around the glyph, and a glowing rule under the bar so it is still findable
-/// once the fill has run past its cell.
-fn draw_day_letters(
+/// The fill ramps across the column's width, not down its height. That is the
+/// one place this differs from the old bar treatment, and it matters: the LED
+/// ramp runs its bright `mid` stop to its dark `edge` stop over the fill's
+/// height, which on a 28px column lays the dark end along the bottom, where it
+/// sat barely above the track and the level became unreadable. Ramping across
+/// five pixels instead keeps every row of the fill lit.
+fn draw_ram_column(
     hdc: HDC,
-    bar_x: i32,
-    y: i32,
-    bar_w: i32,
-    fill_w: i32,
-    week: &WeekBlocks,
-    weekdays: &[&'static str; 7],
-    led: &Led,
-    track: &Color,
+    x: i32,
+    percent: f64,
+    lo: f64,
+    hi: f64,
+    is_dark: bool,
     bg: &Color,
     breath: f64,
 ) {
-    let seg_h = sc(SEGMENT_H);
-    let corner_r = sc(CORNER_RADIUS);
-    let gap = sc(SEGMENT_GAP);
-    let blocks = WEEKLY_BLOCKS;
-    let lit_hi = bar_x + fill_w.clamp(0, bar_w);
+    let percent = percent.clamp(0.0, 100.0);
+    let led = ram_led(percent);
+    let track = ram_track_color(is_dark);
+    let w = sc(RAM_W).max(3);
+    let h = sc(RAM_H);
+    let y = sc(RAM_Y);
+    let radius = w / 2;
+    let fill_h = ((h as f64) * percent / 100.0).round() as i32;
 
-    let cell_of = |index: i32| {
-        let (left, right) = block_bounds(bar_w, blocks, gap, index);
-        RECT {
-            left: bar_x + left,
+    unsafe {
+        if breath > 0.02 && fill_h > 0 {
+            for i in (1..=2).rev() {
+                let grow = sc(i);
+                let a = 0.18 * breath * (1.0 - (i as f64 - 1.0) / 2.0);
+                let rect = RECT {
+                    left: x - grow,
+                    top: y + h - fill_h - grow,
+                    right: x + w + grow,
+                    bottom: y + h + grow,
+                };
+                draw_rounded_rect(hdc, &rect, &blend(*bg, led.glow, a), radius + grow);
+            }
+        }
+
+        let track_rect = RECT {
+            left: x,
             top: y,
-            right: bar_x + right,
-            bottom: y + seg_h,
+            right: x + w,
+            bottom: y + h,
+        };
+        draw_rounded_rect(hdc, &track_rect, &track, radius);
+
+        if fill_h > 0 {
+            let fy = y + h - fill_h;
+            let rgn = CreateRoundRectRgn(x, fy, x + w + 1, y + h + 1, radius * 2, radius * 2);
+            let _ = SelectClipRgn(hdc, rgn);
+
+            let centre = blend(led.mid, led.core, 0.10 + 0.30 * breath);
+            let flank = blend(centre, led.edge, 0.50);
+            let half = (((w - 1) as f64) / 2.0).max(1.0);
+            for c in 0..w {
+                let t = ((c as f64 - ((w - 1) as f64) / 2.0) / half).abs().clamp(0.0, 1.0);
+                fill_box(hdc, x + c, fy, 1, fill_h, &blend(centre, flank, t));
+            }
+
+            let _ = SelectClipRgn(hdc, HRGN::default());
+            let _ = DeleteObject(rgn);
+
+            // Bright cap riding the head, so the level is findable at a glance
+            // however dark the body of the fill has gone.
+            let cap = blend(led.core, led.glow, 0.20 + 0.40 * breath);
+            fill_box(hdc, x, fy, w, sc(1).max(1), &cap);
         }
-    };
+
+        // The range the reading has been moving through, as two ticks beside
+        // the column so they cannot be read as part of the level itself.
+        let tick = blend(*bg, led.mid, 0.45);
+        let thin = sc(1).max(1);
+        for v in [lo, hi] {
+            let ty = y + h - ((h as f64) * v.clamp(0.0, 100.0) / 100.0).round() as i32;
+            fill_box(hdc, x - sc(2), ty, thin, thin, &tick);
+        }
+    }
+}
+
+/// Everything one usage row needs. Two of these per provider: the five-hour
+/// window, then the weekly one, which also carries the day band.
+struct RowDraw<'a> {
+    x: i32,
+    y: i32,
+    shown: f64,
+    pace: Option<f64>,
+    time_text: &'a str,
+    base: Led,
+    week: Option<WeekBlocks>,
+    weekdays: &'a [&'static str; 7],
+    is_dark: bool,
+    bg: Color,
+    track: Color,
+    ink: Color,
+    breath: f64,
+    flash: f64,
+    text_tick: f64,
+}
+
+/// One usage row: the percentage, the time to reset, a hairline gauge, and -
+/// on the weekly row - the seven weekday initials.
+///
+/// The only thing here that breathes continuously is the ember on the fill
+/// head, and the only thing that breathes loudly is the overdraft. A row that
+/// is under pace and not yet high sits almost still, which is what makes the
+/// loud state worth looking at.
+fn draw_numeric_row(
+    hdc: HDC,
+    o: &RowDraw,
+    figure_font: HFONT,
+    time_font: HFONT,
+    day_font: HFONT,
+    day_font_bold: HFONT,
+) {
+    let pct = o.shown.clamp(0.0, 100.0);
+    let burn = o.pace.map(|p| pct - p).unwrap_or(0.0);
+    let led = state_led(pct, burn, &o.base);
+    let rule_w = sc(RULE_W);
+    let ry = o.y + sc(RULE_DY);
+    let thin = sc(1).max(1);
+    let fill_x = ((rule_w as f64) * pct / 100.0).round() as i32;
 
     unsafe {
-        // Everything below is clipped to the bar's rounded silhouette so the
-        // first and last blocks do not square off its corners.
-        let bar_rgn = CreateRoundRectRgn(
-            bar_x,
-            y,
-            bar_x + bar_w + 1,
-            y + seg_h + 1,
-            corner_r * 2,
-            corner_r * 2,
-        );
-
-        // Breathing wash behind today, on the unlit side only: it tints bare
-        // track without dulling the LED where the two overlap.
-        if let Some(t) = week.today {
-            let _ = SelectClipRgn(hdc, bar_rgn);
-            let _ = IntersectClipRect(hdc, lit_hi, y, bar_x + bar_w, y + seg_h);
-            let wash = blend(*track, led.glow, 0.12 + 0.26 * breath);
-            let brush = CreateSolidBrush(COLORREF(wash.to_colorref()));
-            FillRect(hdc, &cell_of(t as i32), brush);
-            let _ = DeleteObject(brush);
-            let _ = SelectClipRgn(hdc, HRGN::default());
-        }
-
-        let normal = day_font(FW_SEMIBOLD);
-        let bold = day_font(FW_BOLD);
-        let old_font = SelectObject(hdc, normal);
-
-        // One pass per side of the fill edge: clip range, ordinary ink, today's
-        // ink, today's bloom colour, and whether that bloom is a single-corner
-        // emboss (over the LED, where a halo would only wash out) or a full
-        // four-way glow (over the track, where it reads as light).
-        let on_fill = day_ink_on_fill(led);
-        // The emboss always runs opposite the ink it outlines, so the glyph
-        // stays defined even at the point in the breath where ink and fill are
-        // closest in lightness.
-        let emboss_ink = if luminance(on_fill) > 0.5 {
-            Color::from_hex("#02070B")
+        // The figure, flashed toward the state's core colour for a beat after a
+        // reading lands so the change is what draws the eye, not the motion.
+        let figure = if o.is_dark {
+            blend(o.ink, led.core, 0.30 + 0.60 * o.flash)
         } else {
-            blend(led.core, Color::from_hex("#FFFFFF"), 0.5)
+            blend(o.ink, led.edge, 0.45 + 0.40 * o.flash)
         };
-        let passes = [
-            (
-                bar_x,
-                lit_hi,
-                on_fill,
-                blend(on_fill, Color::from_hex("#000000"), 0.4),
-                emboss_ink,
-                true,
-            ),
-            (
-                lit_hi,
-                bar_x + bar_w,
-                day_ink_on_track(track, led, 0.22),
-                day_ink_on_track(track, led, 0.55),
-                blend(*track, led.glow, 0.30 + 0.50 * breath),
-                false,
-            ),
-        ];
-
-        for (lo, hi, ink, today_ink, bloom, emboss) in passes {
-            if hi <= lo {
-                continue;
-            }
-            let _ = SelectClipRgn(hdc, bar_rgn);
-            let _ = IntersectClipRect(hdc, lo, y, hi, y + seg_h);
-
-            for i in 0..blocks {
-                let cell = cell_of(i);
-                let is_today = week.today == Some(i as usize);
-                let label = weekdays[week.days[i as usize] % 7];
-                SelectObject(hdc, if is_today { bold } else { normal });
-
-                if is_today {
-                    let offsets: &[(i32, i32)] = if emboss {
-                        &[(-1, -1)]
-                    } else {
-                        &[(-1, 0), (1, 0), (0, -1), (0, 1)]
-                    };
-                    let _ = SetTextColor(hdc, COLORREF(bloom.to_colorref()));
-                    for (dx, dy) in offsets {
-                        draw_centered(hdc, &cell, label, *dx, *dy);
-                    }
-                }
-
-                let color = if is_today { today_ink } else { ink };
-                let _ = SetTextColor(hdc, COLORREF(color.to_colorref()));
-                draw_centered(hdc, &cell, label, 0, 0);
-            }
-
-            let _ = SelectClipRgn(hdc, HRGN::default());
-        }
-
-        SelectObject(hdc, old_font);
-        let _ = DeleteObject(normal);
-        let _ = DeleteObject(bold);
-        let _ = DeleteObject(bar_rgn);
-
-        // Glowing rule under today's block, outside the bar, so the current day
-        // stays marked even when its cell is fully lit.
-        if let Some(t) = week.today {
-            let cell = cell_of(t as i32);
-            let rule = blend(*bg, led.glow, 0.35 + 0.45 * breath);
-            let brush = CreateSolidBrush(COLORREF(rule.to_colorref()));
-            let top = y + seg_h + sc(2);
-            let r = RECT {
-                left: cell.left,
-                top,
-                right: cell.right,
-                bottom: top + sc(1).max(1),
-            };
-            FillRect(hdc, &r, brush);
-            let _ = DeleteObject(brush);
-        }
-    }
-}
-
-/// Fill a rounded rectangle with an LED-style gradient: a vertical body
-/// (`mid` at the top, `edge` at the bottom), a `core` highlight that peaks at
-/// the vertical centre, and a low-breath dimming veil so the breath actually
-/// bottoms out dark. Drawn row by row inside a rounded clip.
-fn draw_led_fill(hdc: HDC, rect: &RECT, led: &Led, breath: f64, corner_r: i32) {
-    let h = rect.bottom - rect.top;
-    let w = rect.right - rect.left;
-    if h <= 0 || w <= 0 {
-        return;
-    }
-    unsafe {
-        let rgn = CreateRoundRectRgn(
-            rect.left,
-            rect.top,
-            rect.right + 1,
-            rect.bottom + 1,
-            corner_r * 2,
-            corner_r * 2,
+        SelectObject(hdc, figure_font);
+        draw_text_in(
+            hdc,
+            RECT {
+                left: o.x,
+                top: o.y,
+                right: o.x + sc(FIGURE_W),
+                bottom: o.y + sc(ROW_H),
+            },
+            &format!("{}%", pct.round() as i32),
+            &figure,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
         );
-        let _ = SelectClipRgn(hdc, rgn);
 
-        let veil = Color::from_hex("#02060A");
-        let hi = 0.04 + 0.66 * breath; // core-highlight strength
-        let dim = 0.28 * (1.0 - breath); // low-breath dimming
-        let denom = ((h - 1).max(1)) as f64;
-        let half = (h as f64) / 2.0;
-        for row in 0..h {
-            let vt = row as f64 / denom; // 0 at top, 1 at bottom
-            let mut c = blend(led.mid, led.edge, vt);
-            let cw = (1.0 - ((row as f64 - denom / 2.0) / half).abs()).clamp(0.0, 1.0);
-            c = blend(c, led.core, cw * hi);
-            c = blend(c, veil, dim);
-            let row_rect = RECT {
-                left: rect.left,
-                top: rect.top + row,
-                right: rect.right,
-                bottom: rect.top + row + 1,
-            };
-            let brush = CreateSolidBrush(COLORREF(c.to_colorref()));
-            FillRect(hdc, &row_rect, brush);
-            let _ = DeleteObject(brush);
-        }
-
-        let _ = SelectClipRgn(hdc, HRGN::default());
-        let _ = DeleteObject(rgn);
-    }
-}
-
-/// Draw a soft, breathing halo around a fill rectangle as a stack of
-/// progressively larger, fainter rounded rects. Each is opaque but blended
-/// toward the background, which reads as a translucent glow once the widget is
-/// composited over the taskbar. Strength scales with the breath, so at the
-/// bottom of the breath there is no halo at all.
-fn draw_led_glow(hdc: HDC, fill: &RECT, glow: &Color, bg: &Color, breath: f64, corner_r: i32) {
-    if breath <= 0.02 {
-        return;
-    }
-    let layers = 4;
-    // Largest (faintest) first so the brighter inner rings land on top.
-    for i in (1..=layers).rev() {
-        let grow = sc(i);
-        let a = (0.42 * breath) * (1.0 - (i as f64 - 1.0) / layers as f64);
-        if a <= 0.02 {
-            continue;
-        }
-        let c = blend(*bg, *glow, a);
-        let r = RECT {
-            left: fill.left - grow,
-            top: fill.top - grow,
-            right: fill.right + grow,
-            bottom: fill.bottom + grow,
+        // The countdown, brightened for a beat whenever a digit rolls over.
+        let lift = if o.is_dark {
+            Color::from_hex("#FFFFFF")
+        } else {
+            Color::from_hex("#000000")
         };
-        draw_rounded_rect(hdc, &r, &c, corner_r + grow);
+        SelectObject(hdc, time_font);
+        draw_text_in(
+            hdc,
+            RECT {
+                left: o.x + sc(TIME_DX),
+                top: o.y,
+                right: o.x + sc(PROVIDER_W),
+                bottom: o.y + sc(ROW_H),
+            },
+            o.time_text,
+            &blend(o.ink, lift, 0.55 * o.text_tick),
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+        );
+
+        // The hairline gauge.
+        fill_box(hdc, o.x, ry, rule_w, thin, &o.track);
+        if fill_x > 0 {
+            fill_box(
+                hdc,
+                o.x,
+                ry,
+                fill_x,
+                thin,
+                &blend(led.mid, led.core, 0.10 + 0.25 * o.breath),
+            );
+        }
+
+        if let Some(pace) = o.pace {
+            let pace_x = ((rule_w as f64) * pace.clamp(0.0, 100.0) / 100.0).round() as i32;
+            // Overdraft: the stretch between where an even spend would have put
+            // you and where you actually are. Nothing else on the row breathes
+            // this hard, and it is absent entirely when you are under pace.
+            if burn > 0.5 && fill_x > pace_x {
+                let hot = hot_led();
+                fill_box(
+                    hdc,
+                    o.x + pace_x,
+                    ry - thin,
+                    fill_x - pace_x,
+                    thin * 3,
+                    &blend(hot.mid, hot.core, 0.15 + 0.45 * o.breath),
+                );
+            }
+            fill_box(
+                hdc,
+                o.x + pace_x,
+                ry - sc(2),
+                thin,
+                sc(4),
+                &blend(pace_marker_color(o.is_dark), o.bg, 0.35),
+            );
+        }
+
+        // Ember on the fill head: low amplitude while there is nothing to act
+        // on, full amplitude once the state turns.
+        let loud = pct >= 70.0 || burn >= 8.0;
+        let amp = if loud {
+            0.45 + 0.55 * o.breath
+        } else {
+            0.18 + 0.30 * o.breath
+        };
+        fill_box(
+            hdc,
+            o.x + (fill_x - thin).max(0),
+            ry - thin,
+            thin * 2,
+            if loud { thin * 3 } else { thin * 2 },
+            &blend(o.bg, led.glow, amp),
+        );
+
+        // The day band. Seven initials under the weekly rule, the last of them
+        // the day the quota resets on; today is bold and lit, and breathes.
+        if let Some(week) = o.week {
+            let band_y = o.y + sc(DAY_DY);
+            let band_h = sc(DAY_BAND_H);
+            let quiet = blend(o.bg, o.ink, 0.72);
+            for d in 0..WEEKLY_BLOCKS {
+                let left = o.x + ((rule_w as f64) * d as f64 / WEEKLY_BLOCKS as f64).round() as i32;
+                let right =
+                    o.x + ((rule_w as f64) * (d + 1) as f64 / WEEKLY_BLOCKS as f64).round() as i32;
+                let is_today = week.today == Some(d as usize);
+                SelectObject(hdc, if is_today { day_font_bold } else { day_font });
+                let color = if is_today {
+                    blend(o.bg, led.glow, 0.60 + 0.40 * o.breath)
+                } else {
+                    quiet
+                };
+                draw_text_in(
+                    hdc,
+                    RECT {
+                        left,
+                        top: band_y,
+                        right,
+                        bottom: band_y + band_h,
+                    },
+                    o.weekdays[week.days[d as usize] % 7],
+                    &color,
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                );
+            }
+        }
     }
 }
 
@@ -4255,196 +4223,5 @@ fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
         let _ = FillRgn(hdc, rgn, brush);
         let _ = DeleteObject(rgn);
         let _ = DeleteObject(brush);
-    }
-}
-
-/// Draw the device-RAM ring gauge: a circular track with an emerald arc that
-/// fills clockwise from twelve o'clock to `percent`, a bright bead riding the
-/// arc head, the exact "NN%" centred inside, and a soft breathing glow. A thin
-/// divider then separates it from the model bars. `height` is the full widget
-/// height, used to centre both the ring and the divider vertically.
-fn draw_ram_ring(hdc: HDC, x: i32, height: i32, percent: u32, is_dark: bool, bg: &Color) {
-    let led = ring_led();
-    let track = ram_track_color(is_dark);
-    let breath = anim_breath();
-    let d = sc(RING_D);
-    let cx = x + d / 2;
-    let cy = height / 2;
-    let stroke = sc(RING_STROKE).max(2);
-    let r_out = d / 2 - sc(1);
-    let r_in = (r_out - stroke).max(1);
-    let r_mid = (r_out + r_in) / 2;
-    let frac = (percent.min(100) as f64) / 100.0;
-
-    // Supersample the ring: GDI draws no antialiasing, so render it at SSx into
-    // an offscreen buffer and downscale with a HALFTONE stretch, which averages
-    // the pixels into smooth edges. Radii below are in 1x units, scaled by SS
-    // only at draw time.
-    const SS: i32 = 4;
-    let margin = sc(4);
-    let box_l = cx - r_out - margin;
-    let box_t = cy - r_out - margin;
-    let box_w = (r_out + margin) * 2;
-    let box_h = (r_out + margin) * 2;
-
-    unsafe {
-        let mem = CreateCompatibleDC(hdc);
-        let bmp = CreateCompatibleBitmap(hdc, box_w * SS, box_h * SS);
-        let old_bmp = SelectObject(mem, bmp);
-
-        // Ring centre inside the offscreen buffer, in supersampled coordinates.
-        let scx = (cx - box_l) * SS;
-        let scy = (cy - box_t) * SS;
-
-        // Fill with the taskbar background so the antialiased edges blend against
-        // it, matching what the widget composites over.
-        let bg_brush = CreateSolidBrush(COLORREF(bg.to_colorref()));
-        let full = RECT { left: 0, top: 0, right: box_w * SS, bottom: box_h * SS };
-        FillRect(mem, &full, bg_brush);
-        let _ = DeleteObject(bg_brush);
-
-        let old_pen = SelectObject(mem, GetStockObject(NULL_PEN));
-        let _ = SetArcDirection(mem, AD_CLOCKWISE);
-
-        // Fill a full disc of `radius` (1x units) with no outline. Its own unsafe
-        // block: an outer unsafe context does not extend across the closure.
-        let fill_disc = move |radius: i32, color: Color| unsafe {
-            let rr = radius * SS;
-            let brush = CreateSolidBrush(COLORREF(color.to_colorref()));
-            let old = SelectObject(mem, brush);
-            let _ = Ellipse(mem, scx - rr, scy - rr, scx + rr + 1, scy + rr + 1);
-            SelectObject(mem, old);
-            let _ = DeleteObject(brush);
-        };
-
-        // Breathing outer glow.
-        if breath > 0.02 {
-            fill_disc(r_out + sc(3), blend(*bg, led.glow, 0.10 + 0.30 * breath));
-        }
-        // Track ring.
-        fill_disc(r_out, track);
-
-        // Progress arc as a wedge, brightened by the breath.
-        if frac > 0.0 {
-            let arc_col = blend(led.mid, led.core, 0.10 + 0.35 * breath);
-            let rr = r_out * SS;
-            let brush = CreateSolidBrush(COLORREF(arc_col.to_colorref()));
-            let old = SelectObject(mem, brush);
-            if frac >= 0.999 {
-                let _ = Ellipse(mem, scx - rr, scy - rr, scx + rr + 1, scy + rr + 1);
-            } else {
-                let a = frac * std::f64::consts::TAU;
-                let big = (d * 2 * SS).max(256);
-                let ex = scx + (big as f64 * a.sin()).round() as i32;
-                let ey = scy - (big as f64 * a.cos()).round() as i32;
-                let _ = Pie(
-                    mem,
-                    scx - rr,
-                    scy - rr,
-                    scx + rr + 1,
-                    scy + rr + 1,
-                    scx,
-                    scy - big,
-                    ex,
-                    ey,
-                );
-            }
-            SelectObject(mem, old);
-            let _ = DeleteObject(brush);
-        }
-
-        // Hollow the centre so track/arc/glow all become rings.
-        fill_disc(r_in, *bg);
-
-        // Bead marker riding the arc head.
-        if frac > 0.0 {
-            let a = frac * std::f64::consts::TAU;
-            let bx = scx + ((r_mid * SS) as f64 * a.sin()).round() as i32;
-            let by = scy - ((r_mid * SS) as f64 * a.cos()).round() as i32;
-            if breath > 0.02 {
-                let hr = (stroke + sc(2)) * SS;
-                let brush =
-                    CreateSolidBrush(COLORREF(blend(*bg, led.glow, 0.35 * breath).to_colorref()));
-                let old = SelectObject(mem, brush);
-                let _ = Ellipse(mem, bx - hr, by - hr, bx + hr + 1, by + hr + 1);
-                SelectObject(mem, old);
-                let _ = DeleteObject(brush);
-            }
-            let core_r = (stroke * 2 / 3).max(2) * SS;
-            let brush = CreateSolidBrush(COLORREF(led.core.to_colorref()));
-            let old = SelectObject(mem, brush);
-            let _ = Ellipse(mem, bx - core_r, by - core_r, bx + core_r + 1, by + core_r + 1);
-            SelectObject(mem, old);
-            let _ = DeleteObject(brush);
-        }
-
-        SelectObject(mem, old_pen);
-
-        // Downscale the supersampled ring into the widget DC for antialiasing.
-        let _ = SetStretchBltMode(hdc, HALFTONE);
-        let _ = SetBrushOrgEx(hdc, 0, 0, None);
-        let _ = StretchBlt(
-            hdc, box_l, box_t, box_w, box_h, mem, 0, 0, box_w * SS, box_h * SS, SRCCOPY,
-        );
-
-        SelectObject(mem, old_bmp);
-        let _ = DeleteObject(bmp);
-        let _ = DeleteDC(mem);
-
-        // Centred "NN%" readout, in a smaller font than the row labels.
-        let font_name = native_interop::wide_str("Segoe UI");
-        let font = CreateFontW(
-            sc(-10),
-            0,
-            0,
-            0,
-            FW_SEMIBOLD.0 as i32,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET.0 as u32,
-            OUT_TT_PRECIS.0 as u32,
-            CLIP_DEFAULT_PRECIS.0 as u32,
-            CLEARTYPE_QUALITY.0 as u32,
-            (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
-            PCWSTR::from_raw(font_name.as_ptr()),
-        );
-        let old_font = SelectObject(hdc, font);
-        let mut text_wide: Vec<u16> = format!("{percent}%").encode_utf16().collect();
-        let mut text_rect = RECT {
-            left: cx - r_in,
-            top: cy - r_in,
-            right: cx + r_in,
-            bottom: cy + r_in,
-        };
-        let _ = SetTextColor(hdc, COLORREF(ram_number_color(is_dark).to_colorref()));
-        let _ = DrawTextW(
-            hdc,
-            &mut text_wide,
-            &mut text_rect,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-        );
-        SelectObject(hdc, old_font);
-        let _ = DeleteObject(font);
-
-        // Thin divider before the model bars, centred vertically to match the
-        // drag-handle divider on the far left.
-        let divider_x = x + d + sc(RING_RIGHT_MARGIN);
-        let divider_h = sc(25);
-        let divider_top = (height - divider_h) / 2;
-        let div_col = if is_dark {
-            native_interop::colorref(70, 70, 70)
-        } else {
-            native_interop::colorref(200, 200, 200)
-        };
-        let div_brush = CreateSolidBrush(COLORREF(div_col));
-        let div_rect = RECT {
-            left: divider_x,
-            top: divider_top,
-            right: divider_x + sc(RAM_DIVIDER_W),
-            bottom: divider_top + divider_h,
-        };
-        FillRect(hdc, &div_rect, div_brush);
-        let _ = DeleteObject(div_brush);
     }
 }
