@@ -1541,6 +1541,14 @@ pub fn format_line(section: &UsageSection, kind: WindowKind, strings: Strings) -
     }
 }
 
+/// Just the time-to-reset, with no percentage in front of it. The widget
+/// prints the percentage as its own figure, so repeating it in the readout
+/// beside it both said the same thing twice and ran the line off the right
+/// edge; `format_line` keeps the combined form for the tray tooltips.
+pub fn format_reset(section: &UsageSection, kind: WindowKind, strings: Strings) -> String {
+    format_countdown(section.resets_at, kind, strings)
+}
+
 fn format_countdown(resets_at: Option<SystemTime>, kind: WindowKind, strings: Strings) -> String {
     let reset = match resets_at {
         Some(t) => t,
