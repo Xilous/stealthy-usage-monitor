@@ -39,6 +39,7 @@ pub enum CredentialWatchMode {
     ActiveSource,
     AllSources,
     Antigravity,
+    Codex,
 }
 
 pub type CredentialWatchSnapshot = Vec<String>;
@@ -47,6 +48,7 @@ pub type CredentialWatchSnapshot = Vec<String>;
 struct UsageResponse {
     five_hour: Option<UsageBucket>,
     seven_day: Option<UsageBucket>,
+    limits: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -81,6 +83,7 @@ struct CodexRateLimitDetails {
 struct CodexRateLimitWindow {
     used_percent: f64,
     reset_at: i64,
+    limit_window_seconds: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -266,11 +269,8 @@ fn poll_codex() -> Result<UsageData, PollError> {
 
     match fetch_codex_usage(&creds.access_token, creds.account_id.as_deref()) {
         Ok(data) => Ok(data),
-        Err(PollError::AuthRequired) => {
-            cli_refresh_codex_token();
-            let refreshed = read_codex_credentials().ok_or(PollError::TokenExpired)?;
-            fetch_codex_usage(&refreshed.access_token, refreshed.account_id.as_deref())
-        }
+        // Monitoring must never start an agent turn to refresh credentials.
+        Err(PollError::AuthRequired) => Err(PollError::TokenExpired),
         Err(error) => Err(error),
     }
 }
@@ -401,50 +401,6 @@ fn cli_refresh_wsl_token(distro: &str) {
     wait_for_refresh(&mut child);
 }
 
-fn cli_refresh_codex_token() {
-    let codex_path = resolve_windows_codex_path();
-    let is_cmd = codex_path.to_lowercase().ends_with(".cmd");
-    let is_ps1 = codex_path.to_lowercase().ends_with(".ps1");
-    diagnose::log(format!(
-        "attempting Windows Codex token refresh via {codex_path}"
-    ));
-
-    let args: &[&str] = &["exec", "."];
-
-    let mut cmd = if is_cmd {
-        let mut c = Command::new("cmd.exe");
-        c.arg("/c").arg(&codex_path).args(args);
-        c
-    } else if is_ps1 {
-        let mut c = Command::new("powershell.exe");
-        c.arg("-NoProfile")
-            .arg("-ExecutionPolicy")
-            .arg("Bypass")
-            .arg("-File")
-            .arg(&codex_path)
-            .args(args);
-        c
-    } else {
-        let mut c = Command::new(&codex_path);
-        c.args(args);
-        c
-    };
-    cmd.creation_flags(CREATE_NO_WINDOW)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(error) => {
-            diagnose::log_error("unable to spawn Windows Codex token refresh", error);
-            return;
-        }
-    };
-
-    wait_for_refresh(&mut child);
-}
-
 /// Spawn a command and wait up to `timeout` for it to finish.
 /// Returns None if the process fails to start or exceeds the deadline.
 fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Option<std::process::Output> {
@@ -520,41 +476,6 @@ fn resolve_windows_claude_path() -> String {
     "claude.cmd".to_string()
 }
 
-fn resolve_windows_codex_path() -> String {
-    for name in &["codex.cmd", "codex.ps1", "codex.exe", "codex"] {
-        if Command::new(name)
-            .arg("--version")
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok()
-        {
-            return name.to_string();
-        }
-    }
-
-    for name in &["codex.cmd", "codex.ps1", "codex.exe", "codex"] {
-        if let Ok(output) = Command::new("where.exe")
-            .arg(name)
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-        {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if let Some(first_line) = stdout.lines().next() {
-                    let path = first_line.trim().to_string();
-                    if !path.is_empty() {
-                        return path;
-                    }
-                }
-            }
-        }
-    }
-
-    "codex.cmd".to_string()
-}
-
 fn build_agent() -> Result<ureq::Agent, PollError> {
     let tls = native_tls::TlsConnector::new().map_err(|_| PollError::RequestFailed)?;
     Ok(ureq::AgentBuilder::new()
@@ -564,6 +485,11 @@ fn build_agent() -> Result<ureq::Agent, PollError> {
 }
 
 pub fn credential_watch_snapshot(mode: CredentialWatchMode) -> CredentialWatchSnapshot {
+    if mode == CredentialWatchMode::Codex {
+        return codex_auth_path()
+            .map(|path| vec![windows_credential_watch_signature(&path)])
+            .unwrap_or_default();
+    }
     if mode == CredentialWatchMode::Antigravity {
         return vec![antigravity_credential_watch_signature()];
     }
@@ -573,13 +499,16 @@ pub fn credential_watch_snapshot(mode: CredentialWatchMode) -> CredentialWatchSn
             .map(|creds| vec![creds.source])
             .unwrap_or_else(all_known_credential_sources),
         CredentialWatchMode::AllSources => all_known_credential_sources(),
-        CredentialWatchMode::Antigravity => unreachable!(),
+        CredentialWatchMode::Antigravity | CredentialWatchMode::Codex => unreachable!(),
     };
 
     let mut snapshot: CredentialWatchSnapshot = sources
         .into_iter()
         .filter_map(|source| credential_watch_signature(&source))
         .collect();
+    if let Some(path) = codex_auth_path() {
+        snapshot.push(windows_credential_watch_signature(&path));
+    }
     snapshot.sort();
     snapshot.dedup();
     snapshot
@@ -707,19 +636,55 @@ fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
         Ok(response) => response,
         Err(_) => return Ok(None),
     };
+    Ok(Some(claude_usage_from_response(response)))
+}
+
+fn claude_usage_from_response(response: UsageResponse) -> UsageData {
     let mut data = UsageData::default();
 
     if let Some(bucket) = &response.five_hour {
+        data.session.available = true;
+        data.session.window_minutes = Some(300);
         data.session.percentage = bucket.utilization;
         data.session.resets_at = parse_iso8601(bucket.resets_at.as_deref());
     }
 
     if let Some(bucket) = &response.seven_day {
+        data.weekly.available = true;
+        data.weekly.window_minutes = Some(10080);
         data.weekly.percentage = bucket.utilization;
         data.weekly.resets_at = parse_iso8601(bucket.resets_at.as_deref());
     }
 
-    Ok(Some(data))
+    // Model quotas arrive in limits[], with percent already in percentage units.
+    // Ignore malformed or unrelated entries without losing the overall quotas.
+    if let Some(limits) = response.limits.as_ref().and_then(|v| v.as_array()) {
+        for limit in limits {
+            let name = limit
+                .pointer("/scope/model/display_name")
+                .and_then(|v| v.as_str());
+            if !name.is_some_and(|name| {
+                name.eq_ignore_ascii_case("Fable")
+                    || name.to_ascii_lowercase().starts_with("fable ")
+            }) {
+                continue;
+            }
+            let Some(percent) = limit.get("percent").and_then(|v| v.as_f64()) else {
+                continue;
+            };
+            if !percent.is_finite() || percent < 0.0 {
+                continue;
+            }
+            data.fable = UsageSection {
+                available: true,
+                window_minutes: Some(10080),
+                percentage: percent,
+                resets_at: parse_iso8601(limit.get("resets_at").and_then(|v| v.as_str())),
+            };
+            break;
+        }
+    }
+    data
 }
 
 fn fetch_usage_via_messages(token: &str) -> Result<UsageData, PollError> {
@@ -764,6 +729,14 @@ fn fetch_usage_via_messages(token: &str) -> Result<UsageData, PollError> {
 
 fn parse_rate_limit_headers(response: &ureq::Response) -> UsageData {
     let mut data = UsageData::default();
+    data.session.available = response
+        .header("anthropic-ratelimit-unified-5h-utilization")
+        .is_some();
+    data.weekly.available = response
+        .header("anthropic-ratelimit-unified-7d-utilization")
+        .is_some();
+    data.session.window_minutes = Some(300);
+    data.weekly.window_minutes = Some(10080);
 
     data.session.percentage =
         get_header_f64(response, "anthropic-ratelimit-unified-5h-utilization") * 100.0;
@@ -786,8 +759,14 @@ fn parse_rate_limit_headers(response: &ureq::Response) -> UsageData {
         if status == Some("rejected") {
             let claim = response.header("anthropic-ratelimit-unified-representative-claim");
             match claim {
-                Some("five_hour") => data.session.percentage = 100.0,
-                Some("seven_day") => data.weekly.percentage = 100.0,
+                Some("five_hour") => {
+                    data.session.percentage = 100.0;
+                    data.session.available = true;
+                }
+                Some("seven_day") => {
+                    data.weekly.percentage = 100.0;
+                    data.weekly.available = true;
+                }
                 _ => {}
             }
         }
@@ -838,22 +817,53 @@ fn fetch_codex_usage(token: &str, account_id: Option<&str>) -> Result<UsageData,
 
 fn codex_usage_from_response(response: CodexUsageResponse) -> Option<UsageData> {
     let details = *response.rate_limit.flatten()?;
-    let mut data = UsageData::default();
+    let mut data = UsageData {
+        session: UsageSection {
+            window_minutes: Some(300),
+            ..Default::default()
+        },
+        weekly: UsageSection {
+            window_minutes: Some(10080),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
 
-    if let Some(window) = details.primary_window.flatten() {
-        data.session = codex_section_from_window(&window);
+    // "Primary" is not necessarily the short window: some accounts return
+    // only a weekly primary. Route by duration, retaining positional fallback
+    // for older responses that omit it. Never borrow a model-specific quota.
+    for (index, window) in [
+        details.primary_window.flatten(),
+        details.secondary_window.flatten(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let Some(window) = window else {
+            continue;
+        };
+        let known = matches!(window.limit_window_seconds, Some(18000 | 604800));
+        let target = match window.limit_window_seconds {
+            Some(18000) => &mut data.session,
+            Some(604800) => &mut data.weekly,
+            _ if index == 0 => &mut data.session,
+            _ => &mut data.weekly,
+        };
+        if known || !target.available {
+            let fallback_minutes = target.window_minutes;
+            *target = codex_section_from_window(&window);
+            target.window_minutes = target.window_minutes.or(fallback_minutes);
+        }
     }
 
-    if let Some(window) = details.secondary_window.flatten() {
-        data.weekly = codex_section_from_window(&window);
-    }
-
-    Some(data)
+    (data.session.available || data.weekly.available).then_some(data)
 }
 
 fn codex_section_from_window(window: &CodexRateLimitWindow) -> UsageSection {
     UsageSection {
-        percentage: window.used_percent,
+        available: window.used_percent.is_finite(),
+        window_minutes: window.limit_window_seconds.map(|s| s / 60),
+        percentage: window.used_percent.clamp(0.0, 100.0),
         resets_at: unix_to_system_time(Some(window.reset_at)),
     }
 }
@@ -909,7 +919,11 @@ fn fetch_antigravity_usage_from_endpoint(
     let session = fetch_antigravity_model_quota(base_url, token, project.as_deref())?;
     let weekly = UsageSection::default();
 
-    Ok(UsageData { session, weekly })
+    Ok(UsageData {
+        session,
+        weekly,
+        ..Default::default()
+    })
 }
 
 fn fetch_antigravity_project(base_url: &str, token: &str) -> Result<Option<String>, PollError> {
@@ -1045,6 +1059,8 @@ fn fetch_antigravity_quota_summary(
 fn antigravity_section_from_quota(quota: AntigravityQuotaInfo) -> Option<UsageSection> {
     let remaining = quota.remaining_fraction?.clamp(0.0, 1.0);
     Some(UsageSection {
+        available: true,
+        window_minutes: None,
         percentage: (1.0 - remaining) * 100.0,
         resets_at: parse_iso8601(quota.reset_time.as_deref()),
     })
@@ -1055,6 +1071,8 @@ fn antigravity_section_from_summary_bucket(
 ) -> Option<UsageSection> {
     let remaining = bucket.remaining_fraction?.clamp(0.0, 1.0);
     Some(UsageSection {
+        available: true,
+        window_minutes: None,
         percentage: (1.0 - remaining) * 100.0,
         resets_at: parse_iso8601(bucket.reset_time.as_deref()),
     })
@@ -1532,8 +1550,11 @@ pub enum WindowKind {
 
 /// Format a usage section as "X% · Yh Zm" style text
 pub fn format_line(section: &UsageSection, kind: WindowKind, strings: Strings) -> String {
+    if !section.available {
+        return "n/a".to_string();
+    }
     let pct = format!("{:.0}%", section.percentage);
-    let cd = format_countdown(section.resets_at, kind, strings);
+    let cd = format_reset(section, kind, strings);
     if cd.is_empty() {
         pct
     } else {
@@ -1546,6 +1567,19 @@ pub fn format_line(section: &UsageSection, kind: WindowKind, strings: Strings) -
 /// beside it both said the same thing twice and ran the line off the right
 /// edge; `format_line` keeps the combined form for the tray tooltips.
 pub fn format_reset(section: &UsageSection, kind: WindowKind, strings: Strings) -> String {
+    if !section.available {
+        return "n/a".to_string();
+    }
+    let kind = section
+        .window_minutes
+        .map(|minutes| {
+            if minutes >= 1440 {
+                WindowKind::Weekly
+            } else {
+                WindowKind::Session
+            }
+        })
+        .unwrap_or(kind);
     format_countdown(section.resets_at, kind, strings)
 }
 
@@ -1570,7 +1604,10 @@ pub fn time_until_display_change(
 ) -> Option<Duration> {
     let reset = resets_at?;
     let remaining = reset.duration_since(SystemTime::now()).ok()?;
-    Some(time_until_display_change_from_secs(remaining.as_secs(), kind))
+    Some(time_until_display_change_from_secs(
+        remaining.as_secs(),
+        kind,
+    ))
 }
 
 fn format_countdown_from_secs(total_secs: u64, kind: WindowKind, strings: Strings) -> String {
@@ -1578,12 +1615,18 @@ fn format_countdown_from_secs(total_secs: u64, kind: WindowKind, strings: String
         WindowKind::Session => {
             let hours = total_secs / 3600;
             let mins = (total_secs % 3600) / 60;
-            format!("{hours}{} {mins}{}", strings.hour_suffix, strings.minute_suffix)
+            format!(
+                "{hours}{} {mins}{}",
+                strings.hour_suffix, strings.minute_suffix
+            )
         }
         WindowKind::Weekly => {
             let days = total_secs / 86400;
             let hours = (total_secs % 86400) / 3600;
-            format!("{days}{} {hours}{}", strings.day_suffix, strings.hour_suffix)
+            format!(
+                "{days}{} {hours}{}",
+                strings.day_suffix, strings.hour_suffix
+            )
         }
     }
 }
@@ -1600,7 +1643,7 @@ fn time_until_display_change_from_secs(total_secs: u64, kind: WindowKind) -> Dur
 pub fn is_past_reset(data: &UsageData) -> bool {
     let now = SystemTime::now();
     let past = |s: &UsageSection| matches!(s.resets_at, Some(t) if now.duration_since(t).is_ok());
-    past(&data.session) || past(&data.weekly)
+    past(&data.session) || past(&data.weekly) || past(&data.fable)
 }
 
 pub fn app_is_past_reset(data: &AppUsageData) -> bool {
@@ -1612,6 +1655,115 @@ pub fn app_is_past_reset(data: &AppUsageData) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_fable_uses_scoped_percent_and_its_own_reset() {
+        let response = serde_json::from_str(r#"{
+            "five_hour":{"utilization":12,"resets_at":null},
+            "seven_day":{"utilization":25,"resets_at":"2026-09-22T12:00:00Z"},
+            "limits":[
+                {"percent":99,"scope":{"model":{"display_name":"Opus"}}},
+                {"percent":38,"resets_at":"2026-09-23T12:00:00Z",
+                 "scope":{"model":{"display_name":"Fable"}}}
+            ]
+        }"#).unwrap();
+        let usage = claude_usage_from_response(response);
+        assert_eq!(usage.session.percentage, 12.0);
+        assert_eq!(usage.weekly.percentage, 25.0);
+        assert!(usage.fable.available);
+        assert_eq!(usage.fable.percentage, 38.0);
+        assert_eq!(usage.fable.resets_at, parse_iso8601(Some("2026-09-23T12:00:00Z")));
+    }
+
+    #[test]
+    fn claude_fable_missing_or_malformed_is_unavailable() {
+        for limits in ["null", "{}", "[]", r#"[null,{"scope":{"model":{"display_name":"Fable"}},"percent":"38"}]"#] {
+            let response = serde_json::from_str(&format!(r#"{{"seven_day":{{"utilization":25,"resets_at":null}},"limits":{limits}}}"#)).unwrap();
+            let usage = claude_usage_from_response(response);
+            assert!(usage.weekly.available);
+            assert!(!usage.fable.available);
+        }
+    }
+
+    #[test]
+    fn claude_fable_zero_is_available_without_inventing_a_reset() {
+        let response = serde_json::from_str(r#"{"limits":[{"percent":0,"scope":{"model":{"display_name":"Fable 5.1"}}}]}"#).unwrap();
+        let usage = claude_usage_from_response(response);
+        assert!(usage.fable.available);
+        assert_eq!(usage.fable.percentage, 0.0);
+        assert_eq!(usage.fable.resets_at, None);
+    }
+
+    #[test]
+    fn fable_reset_triggers_refresh() {
+        let usage = UsageData { fable: UsageSection {
+            available: true, resets_at: Some(SystemTime::UNIX_EPOCH), ..Default::default()
+        }, ..Default::default() };
+        assert!(is_past_reset(&usage));
+    }
+
+    #[test]
+    fn codex_parses_both_windows_and_their_durations() {
+        let response = serde_json::from_str(r#"{"rate_limit":{"primary_window":{"used_percent":42,"reset_at":1800000000,"limit_window_seconds":18000},"secondary_window":{"used_percent":81,"reset_at":1800500000,"limit_window_seconds":604800}}}"#).unwrap();
+        let usage = codex_usage_from_response(response).unwrap();
+        assert!(usage.session.available && usage.weekly.available);
+        assert_eq!(usage.session.percentage, 42.0);
+        assert_eq!(usage.session.window_minutes, Some(300));
+        assert_eq!(usage.weekly.window_minutes, Some(10080));
+    }
+
+    #[test]
+    fn codex_missing_windows_are_not_reported_as_zero() {
+        for json in [r#"{}"#, r#"{"rate_limit":null}"#, r#"{"rate_limit":{}}"#] {
+            assert!(codex_usage_from_response(serde_json::from_str(json).unwrap()).is_none());
+        }
+        let response = serde_json::from_str(r#"{"rate_limit":{"primary_window":{"used_percent":0,"reset_at":1800000000},"secondary_window":null}}"#).unwrap();
+        let usage = codex_usage_from_response(response).unwrap();
+        assert!(usage.session.available);
+        assert!(!usage.weekly.available);
+        assert_eq!(
+            format_reset(
+                &usage.weekly,
+                WindowKind::Weekly,
+                LanguageId::English.strings()
+            ),
+            "n/a"
+        );
+    }
+
+    #[test]
+    fn codex_bounds_percentages() {
+        let response = serde_json::from_str(
+            r#"{"rate_limit":{"primary_window":{"used_percent":120,"reset_at":1800000000}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            codex_usage_from_response(response)
+                .unwrap()
+                .session
+                .percentage,
+            100.0
+        );
+    }
+
+    #[test]
+    fn codex_weekly_primary_does_not_become_the_five_hour_quota() {
+        let response = serde_json::from_str(r#"{"rate_limit":{"primary_window":{"used_percent":9,"reset_at":1800000000,"limit_window_seconds":604800},"secondary_window":null},"additional_rate_limits":[{"limit_name":"Codex-Spark","rate_limit":{"primary_window":{"used_percent":0,"reset_at":1800000000,"limit_window_seconds":18000}}}]}"#).unwrap();
+        let usage = codex_usage_from_response(response).unwrap();
+        assert!(!usage.session.available);
+        assert_eq!(usage.session.window_minutes, Some(300));
+        assert!(usage.weekly.available);
+        assert_eq!(usage.weekly.percentage, 9.0);
+        assert_eq!(usage.weekly.window_minutes, Some(10080));
+    }
+
+    #[test]
+    fn codex_reversed_windows_are_matched_by_duration() {
+        let response = serde_json::from_str(r#"{"rate_limit":{"primary_window":{"used_percent":60,"reset_at":1800000000,"limit_window_seconds":604800},"secondary_window":{"used_percent":25,"reset_at":1800000000,"limit_window_seconds":18000}}}"#).unwrap();
+        let usage = codex_usage_from_response(response).unwrap();
+        assert_eq!(usage.session.percentage, 25.0);
+        assert_eq!(usage.weekly.percentage, 60.0);
+    }
     use crate::localization::LanguageId;
 
     #[test]
@@ -1641,19 +1793,28 @@ mod tests {
     fn display_change_follows_minute_and_hour_boundaries() {
         let next = time_until_display_change_from_secs;
 
-        assert_eq!(next(2 * 60 + 5, WindowKind::Session), Duration::from_secs(6));
+        assert_eq!(
+            next(2 * 60 + 5, WindowKind::Session),
+            Duration::from_secs(6)
+        );
         assert_eq!(next(60, WindowKind::Session), Duration::from_secs(1));
-        assert_eq!(next(2 * 3600 + 5, WindowKind::Weekly), Duration::from_secs(6));
+        assert_eq!(
+            next(2 * 3600 + 5, WindowKind::Weekly),
+            Duration::from_secs(6)
+        );
         assert_eq!(next(3600, WindowKind::Weekly), Duration::from_secs(1));
     }
 
     fn usage_with_session_percent(percentage: f64) -> UsageData {
         UsageData {
             session: UsageSection {
+                available: true,
+                window_minutes: None,
                 percentage,
                 resets_at: None,
             },
             weekly: UsageSection::default(),
+            ..Default::default()
         }
     }
 

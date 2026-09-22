@@ -19,16 +19,16 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::appearance::{Appearance, Mode};
 use crate::diagnose;
 use crate::localization::{self, LanguageId, Strings};
 use crate::models::{AppUsageData, UsageData};
 use crate::native_interop::{
     self, Color, TIMER_ANIM, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RAM, TIMER_RESET_POLL,
-    TIMER_TOPMOST, TIMER_UPDATE_CHECK,
-    WM_APP_TRAY,
-    WM_APP_USAGE_UPDATED,
+    TIMER_TOPMOST, TIMER_UPDATE_CHECK, WM_APP_TRAY, WM_APP_USAGE_UPDATED,
 };
 use crate::poller;
+use crate::readout;
 use crate::theme;
 use crate::tray_icon;
 use crate::updater::{self, InstallChannel, ReleaseDescriptor, UpdateCheckResult};
@@ -56,6 +56,7 @@ struct AppState {
     win_event_hook: Option<HWINEVENTHOOK>,
     foreground_hook: Option<HWINEVENTHOOK>,
     is_dark: bool,
+    appearance: Appearance,
     embedded: bool,
     language_override: Option<LanguageId>,
     language: LanguageId,
@@ -92,6 +93,7 @@ struct AppState {
     taskbar_index: usize,
     tray_offset: i32,
     dragging: bool,
+    floating_position: Option<(i32, i32)>,
     drag_start_mouse_x: i32,
     drag_start_client_x: i32,
     drag_start_offset: i32,
@@ -140,6 +142,7 @@ const IDM_LANG_SIMPLIFIED_CHINESE: u16 = 51;
 const IDM_MODEL_CLAUDE_CODE: u16 = 60;
 const IDM_MODEL_CODEX: u16 = 61;
 const IDM_MODEL_ANTIGRAVITY: u16 = 62;
+const IDM_APPEARANCE: u16 = 80;
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
@@ -155,7 +158,7 @@ static SUPPRESS_TRAY_REPOSITION_UNTIL: Mutex<Option<Instant>> = Mutex::new(None)
 static CURRENT_DPI: AtomicU32 = AtomicU32::new(96);
 
 /// Scale a base pixel value (designed at 96 DPI) to the current DPI.
-fn sc(px: i32) -> i32 {
+pub(crate) fn sc(px: i32) -> i32 {
     let dpi = CURRENT_DPI.load(Ordering::Relaxed);
     (px as f64 * dpi as f64 / 96.0).round() as i32
 }
@@ -308,6 +311,13 @@ fn settings_path() -> PathBuf {
 #[derive(Debug, Serialize, Deserialize)]
 struct SettingsFile {
     #[serde(default)]
+    appearance: Appearance,
+    #[serde(default)]
+    floating_position: Option<(i32, i32)>,
+    /// Migrate older taskbar/click-through preferences once.
+    #[serde(default)]
+    desktop_layout_version: u32,
+    #[serde(default)]
     tray_offset: i32,
     #[serde(default)]
     taskbar_index: usize,
@@ -350,6 +360,9 @@ struct SettingsFile {
 impl Default for SettingsFile {
     fn default() -> Self {
         Self {
+            appearance: Appearance::default(),
+            floating_position: None,
+            desktop_layout_version: 1,
             tray_offset: 0,
             taskbar_index: 0,
             poll_interval_ms: default_poll_interval(),
@@ -357,7 +370,7 @@ impl Default for SettingsFile {
             last_update_check_unix: None,
             widget_visible: true,
             show_claude_code: true,
-            show_codex: false,
+            show_codex: true,
             show_antigravity: false,
             embed_in_taskbar: default_embed_in_taskbar(),
             click_through: default_click_through(),
@@ -373,18 +386,13 @@ fn default_widget_visible() -> bool {
     true
 }
 
-// These two defaults are inverted from upstream deliberately. On Windows 11
-// the out-of-the-box combination (embedded + interactive) is broken: the
-// widget is composited beneath the taskbar's XAML content so it is effectively
-// invisible, yet still hit-tests, so it silently swallows clicks on the
-// taskbar buttons it covers. Floating + click-through is the configuration
-// that actually works, so it is what a fresh install should get.
+// Desktop popup by default: interactive so the entire widget can be dragged.
 fn default_embed_in_taskbar() -> bool {
     false
 }
 
 fn default_click_through() -> bool {
-    true
+    false
 }
 
 fn default_show_claude_code() -> bool {
@@ -392,7 +400,7 @@ fn default_show_claude_code() -> bool {
 }
 
 fn default_show_codex() -> bool {
-    false
+    true
 }
 
 fn default_show_antigravity() -> bool {
@@ -405,10 +413,19 @@ fn load_settings() -> SettingsFile {
         Err(_) => return SettingsFile::default(),
     };
     let mut settings: SettingsFile = serde_json::from_str(&content).unwrap_or_default();
+    migrate_desktop_settings(&mut settings);
     if !settings.show_claude_code && !settings.show_codex && !settings.show_antigravity {
         settings.show_claude_code = true;
     }
     settings
+}
+
+fn migrate_desktop_settings(settings: &mut SettingsFile) {
+    if settings.desktop_layout_version == 0 {
+        settings.embed_in_taskbar = false;
+        settings.click_through = false;
+        settings.desktop_layout_version = 1;
+    }
 }
 
 fn save_settings(settings: &SettingsFile) {
@@ -425,6 +442,9 @@ fn save_state_settings() {
     let state = lock_state();
     if let Some(s) = state.as_ref() {
         save_settings(&SettingsFile {
+            appearance: s.appearance.clone(),
+            floating_position: s.floating_position,
+            desktop_layout_version: 1,
             tray_offset: s.tray_offset,
             taskbar_index: s.taskbar_index,
             poll_interval_ms: s.poll_interval_ms,
@@ -442,6 +462,33 @@ fn save_state_settings() {
     }
 }
 
+fn fable_readout_from_state(s: &AppState) -> (f64, String) {
+    if !s.last_poll_ok {
+        return (0.0, if s.weekly_text == "!" { "!" } else { "..." }.to_owned());
+    }
+    match s.data.as_ref().and_then(|data| data.claude_code.as_ref()) {
+        Some(usage) => {
+            let reset = poller::format_reset(
+                &usage.fable,
+                poller::WindowKind::Weekly,
+                s.language.strings(),
+            );
+            (
+                usage.fable.percentage,
+                if reset.is_empty() { "--".to_owned() } else { reset },
+            )
+        }
+        None => (0.0, "!".to_owned()),
+    }
+}
+
+fn fable_readout() -> (f64, String) {
+    lock_state()
+        .as_ref()
+        .map(fable_readout_from_state)
+        .unwrap_or_else(|| (0.0, "...".to_owned()))
+}
+
 fn tray_icon_data_from_state() -> Vec<tray_icon::TrayIconData> {
     let state = lock_state();
     match state.as_ref() {
@@ -450,42 +497,47 @@ fn tray_icon_data_from_state() -> Vec<tray_icon::TrayIconData> {
             if s.show_claude_code {
                 icons.push(tray_icon::TrayIconData {
                     kind: tray_icon::TrayIconKind::Claude,
-                    percent: Some(s.session_percent),
+                    percent: readout::has_reading(&s.session_text).then_some(s.session_percent),
                     tooltip: format!(
-                        "{} 5h: {:.0}% {} | 7d: {:.0}% {}",
+                        "{} 5h: {} | 7d: {} | Fable: {}",
                         s.language.strings().claude_code_model,
-                        s.session_percent,
-                        s.session_text,
-                        s.weekly_percent,
-                        s.weekly_text
+                        readout::tooltip_row(s.session_percent, &s.session_text),
+                        readout::tooltip_row(s.weekly_percent, &s.weekly_text),
+                        {
+                            let (pct, reset) = fable_readout_from_state(s);
+                            readout::tooltip_row(pct, &reset)
+                        }
                     ),
                 });
             }
             if s.show_codex {
                 icons.push(tray_icon::TrayIconData {
                     kind: tray_icon::TrayIconKind::Codex,
-                    percent: Some(s.codex_session_percent),
+                    percent: readout::has_reading(&s.codex_weekly_text)
+                        .then_some(s.codex_weekly_percent),
                     tooltip: format!(
-                        "{} 5h: {:.0}% {} | 7d: {:.0}% {}",
+                        "{} 7d: {}",
                         s.language.strings().codex_model,
-                        s.codex_session_percent,
-                        s.codex_session_text,
-                        s.codex_weekly_percent,
-                        s.codex_weekly_text
+                        readout::tooltip_row(s.codex_weekly_percent, &s.codex_weekly_text)
                     ),
                 });
             }
             if s.show_antigravity {
                 icons.push(tray_icon::TrayIconData {
                     kind: tray_icon::TrayIconKind::Antigravity,
-                    percent: Some(s.antigravity_session_percent),
+                    percent: readout::has_reading(&s.antigravity_session_text)
+                        .then_some(s.antigravity_session_percent),
                     tooltip: format!(
-                        "{} 5h: {:.0}% {} | 7d: {:.0}% {}",
+                        "{} Quota: {} | Extra: {}",
                         s.language.strings().antigravity_model,
-                        s.antigravity_session_percent,
-                        s.antigravity_session_text,
-                        s.antigravity_weekly_percent,
-                        s.antigravity_weekly_text
+                        readout::tooltip_row(
+                            s.antigravity_session_percent,
+                            &s.antigravity_session_text
+                        ),
+                        readout::tooltip_row(
+                            s.antigravity_weekly_percent,
+                            &s.antigravity_weekly_text
+                        )
                     ),
                 });
             }
@@ -1146,12 +1198,8 @@ fn set_startup_enabled(enable: bool) {
     }
 }
 
-// Numeric layout. Each provider gets two rows - the five-hour window above
-// the weekly one - and a row is a percentage figure, a time-to-reset, and a
-// one-pixel hairline gauge beneath them. There are no bars, row labels or ring
-// any more: the figure carries the reading and the hairline carries its shape,
-// which is what lets one provider fit in 114px instead of 298.
-const WIDGET_HEIGHT: i32 = 46;
+// Compact provider cards with an additional Claude Fable quota row.
+const WIDGET_HEIGHT: i32 = 62;
 const LEFT_DIVIDER_W: i32 = 3;
 
 /// Device RAM: a narrow column between the drag handle and the figures.
@@ -1162,26 +1210,22 @@ const RAM_H: i32 = 28;
 
 /// Where the first provider's figures start, and what each provider occupies.
 const CONTENT_X: i32 = 28;
-const PROVIDER_W: i32 = 86;
-const PROVIDER_GAP: i32 = 6;
-/// Colour pip identifying a provider, drawn only when more than one is shown.
-const PIP_W: i32 = 8;
+const PROVIDER_W: i32 = 174;
+const PROVIDER_GAP: i32 = 8;
+/// Space reserved for the quota-window label.
+const LABEL_W: i32 = 42;
 
 /// Row origins and the offsets within a row.
 ///
-/// The 46px budget is spent deliberately, because it does not stretch: the
-/// freshness hairline takes the top row, then two 14px figure bands each with a
-/// gauge two pixels under them, then a ten-pixel day band that reaches the
-/// bottom edge. DrawTextW centres a font's whole line box, not its cap height,
-/// so a band has to clear roughly the point size or the glyphs get cut - which
-/// is what a seven-pixel band did to the weekday initials.
-const ROW1_Y: i32 = 2;
-const ROW2_Y: i32 = 19;
-const ROW_H: i32 = 14;
+/// The 62px budget holds an 11px header and three 12px figure bands, each
+/// followed by its gauge and breathing room.
+const ROW1_Y: i32 = 13;
+const ROW2_Y: i32 = 29;
+const ROW_H: i32 = 12;
 const FIGURE_W: i32 = 38;
 const TIME_DX: i32 = 40;
-const RULE_DY: i32 = 15;
-const RULE_W: i32 = 72;
+const RULE_DY: i32 = 13;
+const RULE_W: i32 = 122;
 const DAY_DY: i32 = 17;
 const DAY_BAND_H: i32 = 10;
 
@@ -1192,9 +1236,9 @@ const WEEKLY_BLOCKS: i32 = 7;
 /// this last stored, so the column drifts continuously between samples.
 const RAM_REFRESH_MS: u32 = 2000;
 
-/// Ambient-animation cadence (~30fps). Drives the breath, the settling
+/// Ambient-animation cadence (10fps). Drives the breath, the settling
 /// figures, the RAM drift and the poll-freshness hairline.
-const ANIM_REFRESH_MS: u32 = 33;
+const ANIM_REFRESH_MS: u32 = 100;
 
 const SESSION_WINDOW: Duration = Duration::from_secs(5 * 60 * 60);
 const WEEKLY_WINDOW: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -1371,7 +1415,10 @@ fn current_ram_percent() -> f64 {
 static RAM_SAMPLE: AtomicU32 = AtomicU32::new(u32::MAX);
 
 fn sample_ram() {
-    RAM_SAMPLE.store((current_ram_percent() * 100.0).round() as u32, Ordering::Relaxed);
+    RAM_SAMPLE.store(
+        (current_ram_percent() * 100.0).round() as u32,
+        Ordering::Relaxed,
+    );
 }
 
 fn last_ram_sample() -> f64 {
@@ -1542,7 +1589,11 @@ fn ram_led(percent: f64) -> Led {
     } else if percent <= 85.0 {
         lerp_led(&ring, &warm_led(), (percent - 60.0) / 25.0)
     } else {
-        lerp_led(&warm_led(), &hot_led(), ((percent - 85.0) / 15.0).clamp(0.0, 1.0))
+        lerp_led(
+            &warm_led(),
+            &hot_led(),
+            ((percent - 85.0) / 15.0).clamp(0.0, 1.0),
+        )
     }
 }
 
@@ -1557,7 +1608,9 @@ fn ram_track_color(is_dark: bool) -> Color {
 
 fn lerp_u8(a: u8, b: u8, t: f64) -> u8 {
     let t = t.clamp(0.0, 1.0);
-    (a as f64 + (b as f64 - a as f64) * t).round().clamp(0.0, 255.0) as u8
+    (a as f64 + (b as f64 - a as f64) * t)
+        .round()
+        .clamp(0.0, 255.0) as u8
 }
 
 /// Blend `a` toward `b` by `t` (0..1). Because the widget is composited opaque
@@ -1595,20 +1648,20 @@ fn anim_breath() -> f64 {
 /// digit rolls over, and `ram` eases toward the last sample so a steady machine
 /// still drifts. All of it is driven off the existing 33ms animation timer.
 struct LiveAnim {
-    shown: [f64; 6],
+    shown: [f64; 7],
     ram: f64,
     ram_lo: f64,
     ram_hi: f64,
     flash: f64,
     text_tick: f64,
-    last_texts: [String; 6],
+    last_texts: [String; 7],
     last_poll: Option<Instant>,
     last_step: Option<Instant>,
 }
 
 #[derive(Clone, Copy)]
 struct LiveFrame {
-    shown: [f64; 6],
+    shown: [f64; 7],
     ram: f64,
     ram_lo: f64,
     ram_hi: f64,
@@ -1621,8 +1674,8 @@ static LIVE_ANIM: Mutex<Option<LiveAnim>> = Mutex::new(None);
 
 /// Advance the animation one frame and hand back the values to draw with.
 fn step_anim(
-    targets: &[f64; 6],
-    texts: &[&str; 6],
+    targets: &[f64; 7],
+    texts: &[&str; 7],
     ram_target: f64,
     poll_interval_ms: u32,
 ) -> LiveFrame {
@@ -1652,7 +1705,7 @@ fn step_anim(
     // Exponential approach: fast enough to feel like a jump, slow enough to
     // read as one.
     let k = 1.0 - (-dt / 0.18).exp();
-    for i in 0..6 {
+    for i in 0..7 {
         let delta = targets[i] - anim.shown[i];
         if delta.abs() < 0.02 {
             anim.shown[i] = targets[i];
@@ -1671,7 +1724,7 @@ fn step_anim(
     anim.ram_lo += (anim.ram - anim.ram_lo) * relax;
     anim.ram_hi += (anim.ram - anim.ram_hi) * relax;
 
-    for i in 0..6 {
+    for i in 0..7 {
         if anim.last_texts[i] != texts[i] {
             if !anim.last_texts[i].is_empty() {
                 anim.text_tick = 1.0;
@@ -1713,30 +1766,6 @@ fn mark_poll() {
     if let Some(anim) = guard.as_mut() {
         anim.flash = 1.0;
         anim.last_poll = Some(Instant::now());
-    }
-}
-
-fn claude_usage_text_color(is_dark: bool) -> Color {
-    if is_dark {
-        Color::from_hex("#F09A7A")
-    } else {
-        Color::from_hex("#A94F32")
-    }
-}
-
-fn codex_usage_text_color(is_dark: bool) -> Color {
-    if is_dark {
-        Color::from_hex("#F5F5F5")
-    } else {
-        Color::from_hex("#1F1F1F")
-    }
-}
-
-fn antigravity_usage_text_color(is_dark: bool) -> Color {
-    if is_dark {
-        Color::from_hex("#8AB4F8")
-    } else {
-        Color::from_hex("#1967D2")
     }
 }
 
@@ -1808,7 +1837,12 @@ pub fn run() {
             diagnose::log("RegisterClassExW returned 0");
         }
 
-        let settings = load_settings();
+        let mut settings = load_settings();
+        if std::env::args().any(|arg| arg == "--codex-only") {
+            settings.show_claude_code = false;
+            settings.show_codex = true;
+            settings.show_antigravity = false;
+        }
         let language_override = settings.language.as_deref().and_then(LanguageId::from_code);
         let language = localization::resolve_language(language_override);
         let install_channel = updater::current_install_channel();
@@ -1863,12 +1897,13 @@ pub fn run() {
 
         diagnose::log(format!("main window created hwnd={:?}", hwnd));
 
-        let is_dark = theme::is_dark_mode();
+        let is_dark = settings.appearance.is_dark(theme::is_dark_mode());
         let mut embedded = false;
 
         {
             let mut state = lock_state();
             *state = Some(AppState {
+                appearance: settings.appearance.clone(),
                 hwnd: SendHwnd::from_hwnd(hwnd),
                 taskbar_hwnd: None,
                 tray_notify_hwnd: None,
@@ -1908,6 +1943,7 @@ pub fn run() {
                 tray_offset: settings.tray_offset,
                 dragging: false,
                 drag_start_mouse_x: 0,
+                floating_position: settings.floating_position,
                 drag_start_client_x: 0,
                 drag_start_offset: 0,
                 widget_visible: settings.widget_visible,
@@ -2044,6 +2080,9 @@ pub fn run() {
         // Message loop
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, HWND::default(), 0, 0).as_bool() {
+            if crate::appearance_studio::translate(&msg) {
+                continue;
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -2133,16 +2172,9 @@ fn render_layered() {
     } else {
         Color::from_hex("#AAAAAA")
     };
-    let text_color = if is_dark {
-        Color::from_hex("#888888")
-    } else {
-        Color::from_hex("#404040")
-    };
-    let bg_color = if is_dark {
-        Color::from_hex("#1C1C1C")
-    } else {
-        Color::from_hex("#F3F3F3")
-    };
+    let palette = appearance().palette(is_dark);
+    let text_color = palette[1];
+    let bg_color = palette[0];
 
     unsafe {
         let screen_dc = GetDC(hwnd);
@@ -2207,6 +2239,7 @@ fn render_layered() {
             show_antigravity,
             &codex_accent,
             &antigravity_accent,
+            fable_readout(),
         );
 
         // Background pixels → alpha 1 (nearly invisible but still hittable for right-click).
@@ -2286,6 +2319,7 @@ fn paint_content(
     show_antigravity: bool,
     codex_accent: &Color,
     antigravity_accent: &Color,
+    fable: (f64, String),
 ) {
     let poll_interval_ms = {
         let state = lock_state();
@@ -2300,7 +2334,24 @@ fn paint_content(
     let _ = (accent, codex_accent, antigravity_accent, track);
 
     let breath = anim_breath();
-    let multi = active_model_count(show_claude_code, show_codex, show_antigravity) > 1;
+    let appearance = appearance();
+    let palette = appearance.palette(is_dark);
+    let custom = appearance.mode == Mode::Custom;
+    // Name every provider, even in single-provider mode: colour alone isn't identity.
+    let labels = {
+        let state = lock_state();
+        let data = state.as_ref().and_then(|s| s.data.as_ref());
+        let codex = data.and_then(|d| d.codex.as_ref());
+        [
+            strings.session_window.to_owned(),
+            strings.weekly_window.to_owned(),
+            readout::window_label(codex.map(|d| &d.session), "5h"),
+            readout::window_label(codex.map(|d| &d.weekly), "7d"),
+            "Quota".to_owned(),
+            "Extra".to_owned(),
+            "Fable".to_owned(),
+        ]
+    };
 
     let targets = [
         session_pct,
@@ -2309,6 +2360,7 @@ fn paint_content(
         codex_weekly_pct,
         antigravity_session_pct,
         antigravity_weekly_pct,
+        fable.0,
     ];
     let texts = [
         session_text,
@@ -2317,6 +2369,7 @@ fn paint_content(
         codex_weekly_text,
         antigravity_session_text,
         antigravity_weekly_text,
+        fable.1.as_str(),
     ];
     let frame = step_anim(&targets, &texts, last_ram_sample(), poll_interval_ms);
 
@@ -2377,7 +2430,7 @@ fn paint_content(
             breath,
         );
 
-        let figure_font = make_font(-14, FW_SEMIBOLD);
+        let figure_font = make_font(-12, FW_SEMIBOLD);
         let time_font = make_font(-10, FW_MEDIUM);
         let day_font = make_font(-9, FW_SEMIBOLD);
         let day_font_bold = make_font(-9, FW_BOLD);
@@ -2388,41 +2441,85 @@ fn paint_content(
                 show_claude_code,
                 claude_led(),
                 0usize,
-                claude_usage_text_color(is_dark),
+                palette[2],
                 week.claude,
             ),
             (
                 show_codex,
                 codex_led(is_dark),
                 2usize,
-                codex_usage_text_color(is_dark),
+                palette[3],
                 week.codex,
             ),
             (
                 show_antigravity,
                 antigravity_led(),
                 4usize,
-                antigravity_usage_text_color(is_dark),
+                palette[4],
                 week.antigravity,
             ),
         ];
 
         let mut x = sc(CONTENT_X);
-        for (visible, base, idx, ident_color, blocks) in providers {
+        for (visible, base, idx, ident_color, _blocks) in providers {
             if !visible {
                 continue;
             }
-            let tx = if multi { x + sc(PIP_W) } else { x };
-            let ink = if multi { ident_color } else { *text_color };
-
-            if multi {
-                // Identity pip: square and small, so it cannot be mistaken for
-                // the RAM column, which is the only gauge drawn as a bar.
-                let pip = sc(3).max(2);
-                for row_y in [sc(ROW1_Y), sc(ROW2_Y)] {
-                    fill_box(hdc, x, row_y + sc(ROW_H) / 2 - pip / 2, pip, pip, &base.mid);
+            let tx = x + sc(LABEL_W);
+            let ink = palette[1];
+            let base = if custom {
+                Led {
+                    edge: blend(ident_color, *bg, 0.4),
+                    mid: ident_color,
+                    core: blend(ident_color, Color::new(255, 255, 255), 0.25),
+                    glow: ident_color,
                 }
-            }
+            } else {
+                base
+            };
+            let card = blend(*bg, ident_color, if is_dark { 0.06 } else { 0.035 });
+            draw_rounded_rect(
+                hdc,
+                &RECT {
+                    left: x,
+                    top: sc(1),
+                    right: x + sc(PROVIDER_W),
+                    bottom: height - sc(1),
+                },
+                &card,
+                sc(4),
+            );
+            fill_box(hdc, x + sc(6), sc(5), sc(3), sc(3), &ident_color);
+            SelectObject(hdc, day_font_bold);
+            draw_text_in(
+                hdc,
+                RECT {
+                    left: x + sc(13),
+                    top: sc(1),
+                    right: x + sc(83),
+                    bottom: sc(12),
+                },
+                match idx {
+                    0 => "CLAUDE",
+                    2 => "CODEX",
+                    _ => "ANTIGRAVITY",
+                },
+                &ident_color,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+            );
+            SelectObject(hdc, day_font);
+            draw_text_in(
+                hdc,
+                RECT {
+                    left: x + sc(86),
+                    top: sc(1),
+                    right: x + sc(PROVIDER_W - 8),
+                    bottom: sc(12),
+                },
+                "USED / RESET IN",
+                &blend(card, ink, 0.65),
+                DT_RIGHT | DT_VCENTER | DT_SINGLELINE,
+            );
 
             let rows = [
                 (
@@ -2435,10 +2532,35 @@ fn paint_content(
                     sc(ROW2_Y),
                     idx + 1,
                     if idx == 0 { weekly_pace } else { None },
-                    blocks,
+                    None,
                 ),
             ];
+            let rows = rows.into_iter().chain(
+                (idx == 0).then_some((sc(45), 6, None, None)),
+            );
             for (row_y, slot, pace, week_blocks) in rows {
+                // Codex displays only its general weekly quota, not Spark's 5h limit.
+                if idx == 2 && slot == idx {
+                    continue;
+                }
+                let row_y = if idx == 2 {
+                    sc((ROW1_Y + ROW2_Y) / 2)
+                } else {
+                    row_y
+                };
+                SelectObject(hdc, day_font);
+                draw_text_in(
+                    hdc,
+                    RECT {
+                        left: x + sc(6),
+                        top: row_y,
+                        right: tx - sc(3),
+                        bottom: row_y + sc(ROW_H),
+                    },
+                    &labels[slot],
+                    &blend(card, ink, 0.65),
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+                );
                 draw_numeric_row(
                     hdc,
                     &RowDraw {
@@ -2451,9 +2573,10 @@ fn paint_content(
                         week: week_blocks,
                         weekdays: &strings.weekday_initials,
                         is_dark,
-                        bg: *bg,
-                        track: *track,
+                        bg: card,
+                        track: blend(card, ink, 0.14),
                         ink,
+                        custom_ink: custom,
                         breath,
                         flash: frame.flash,
                         text_tick: frame.text_tick,
@@ -2556,6 +2679,16 @@ fn do_poll(send_hwnd: SendHwnd) {
         }
         Err(e) => {
             let auth_watch = match e {
+                poller::PollError::AuthRequired
+                | poller::PollError::TokenExpired
+                | poller::PollError::NoCredentials
+                    if show_codex && !show_claude_code && !show_antigravity =>
+                {
+                    Some((
+                        poller::CredentialWatchMode::Codex,
+                        poller::credential_watch_snapshot(poller::CredentialWatchMode::Codex),
+                    ))
+                }
                 poller::PollError::AuthRequired | poller::PollError::TokenExpired
                     if show_antigravity && !show_claude_code && !show_codex =>
                 {
@@ -2708,6 +2841,9 @@ fn schedule_countdown_timer() {
     let delays = [
         data.claude_code.as_ref().and_then(session_change),
         data.claude_code.as_ref().and_then(weekly_change),
+        data.claude_code.as_ref().and_then(|usage| {
+            poller::time_until_display_change(usage.fable.resets_at, poller::WindowKind::Weekly)
+        }),
         data.codex.as_ref().and_then(session_change),
         data.codex.as_ref().and_then(weekly_change),
         data.antigravity.as_ref().and_then(session_change),
@@ -2719,9 +2855,7 @@ fn schedule_countdown_timer() {
     // keeps moving between countdown display changes (which can be hours
     // apart for long windows).
     let now = SystemTime::now();
-    let live = |resets_at: Option<SystemTime>| {
-        matches!(resets_at, Some(t) if t.duration_since(now).is_ok())
-    };
+    let live = |resets_at: Option<SystemTime>| matches!(resets_at, Some(t) if t.duration_since(now).is_ok());
     let pace_marker_live = s.show_claude_code
         && data.claude_code.as_ref().map_or(false, |usage| {
             live(usage.session.resets_at) || live(usage.weekly.resets_at)
@@ -2739,7 +2873,7 @@ fn schedule_countdown_timer() {
 }
 
 fn check_theme_change() {
-    let new_dark = theme::is_dark_mode();
+    let new_dark = appearance().is_dark(theme::is_dark_mode());
     let changed = {
         let mut state = lock_state();
         if let Some(s) = state.as_mut() {
@@ -2756,6 +2890,26 @@ fn check_theme_change() {
     if changed {
         render_layered();
     }
+}
+
+pub(crate) fn appearance() -> Appearance {
+    lock_state()
+        .as_ref()
+        .map(|s| s.appearance.clone())
+        .unwrap_or_default()
+}
+
+pub(crate) fn set_appearance(value: Appearance) {
+    let dark = value.is_dark(theme::is_dark_mode());
+    {
+        let mut state = lock_state();
+        if let Some(s) = state.as_mut() {
+            s.appearance = value;
+            s.is_dark = dark;
+        }
+    }
+    save_state_settings();
+    render_layered();
 }
 
 fn check_language_change() {
@@ -2804,6 +2958,11 @@ fn tray_reposition_is_suppressed() -> bool {
 
 fn position_at_taskbar() {
     refresh_dpi();
+    let floating = lock_state().as_ref().map(|s| !s.embedded).unwrap_or(false);
+    if floating {
+        position_floating_widget();
+        return;
+    }
     // Drop the app-state lock before any Win32 call that may synchronously
     // re-enter our window procedure.
     let (hwnd, embedded, tray_offset, taskbar_hwnd) = {
@@ -2891,6 +3050,120 @@ fn position_at_taskbar() {
 fn compute_anchor_y(anchor_top: i32, anchor_height: i32, widget_height: i32) -> i32 {
     let anchor_bottom = anchor_top + anchor_height;
     (anchor_bottom - widget_height).max(anchor_top)
+}
+
+fn clamp_desktop_position(x: i32, y: i32, width: i32, height: i32, work: RECT) -> (i32, i32) {
+    (
+        x.clamp(work.left, (work.right - width).max(work.left)),
+        y.clamp(work.top, (work.bottom - height).max(work.top)),
+    )
+}
+
+#[cfg(test)]
+mod desktop_tests {
+    use super::*;
+
+    #[test]
+    fn positions_are_kept_inside_the_monitor_work_area() {
+        let work = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
+        assert_eq!(clamp_desktop_position(300, 200, 384, 46, work), (300, 200));
+        assert_eq!(clamp_desktop_position(2100, -40, 384, 46, work), (1536, 0));
+        assert_eq!(
+            clamp_desktop_position(1900, 1100, 384, 46, work),
+            (1536, 994)
+        );
+    }
+
+    #[test]
+    fn negative_monitor_coordinates_and_small_displays_are_supported() {
+        let work = RECT {
+            left: -1280,
+            top: -900,
+            right: 0,
+            bottom: 0,
+        };
+        assert_eq!(
+            clamp_desktop_position(-900, -700, 384, 46, work),
+            (-900, -700)
+        );
+        assert_eq!(clamp_desktop_position(-10, -10, 384, 46, work), (-384, -46));
+        assert_eq!(
+            clamp_desktop_position(0, 0, 2000, 1000, work),
+            (-1280, -900)
+        );
+    }
+
+    #[test]
+    fn old_settings_migrate_without_losing_provider_choices() {
+        let mut settings: SettingsFile = serde_json::from_str(r#"{"embed_in_taskbar":true,"click_through":true,"show_claude_code":false,"show_codex":true}"#).unwrap();
+        migrate_desktop_settings(&mut settings);
+        assert!(!settings.embed_in_taskbar && !settings.click_through);
+        assert!(!settings.show_claude_code && settings.show_codex);
+        settings.floating_position = Some((-800, 240));
+        let saved = serde_json::to_string(&settings).unwrap();
+        let restored: SettingsFile = serde_json::from_str(&saved).unwrap();
+        assert_eq!(restored.floating_position, Some((-800, 240)));
+        assert_eq!(restored.desktop_layout_version, 1);
+    }
+}
+
+/// Desktop position is independent of taskbar events and tray icon movement.
+fn position_floating_widget() {
+    let (hwnd, saved, width) = {
+        let state = lock_state();
+        let Some(s) = state.as_ref() else {
+            return;
+        };
+        if s.dragging {
+            return;
+        }
+        (
+            s.hwnd.to_hwnd(),
+            s.floating_position,
+            total_widget_width_for_state(s),
+        )
+    };
+    let height = sc(WIDGET_HEIGHT);
+    let (x, y) = saved.unwrap_or((0, 0));
+    unsafe {
+        let monitor = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return;
+        }
+        let (x, y) =
+            saved.unwrap_or((info.rcWork.right - width - sc(16), info.rcWork.top + sc(16)));
+        let position = clamp_desktop_position(x, y, width, height, info.rcWork);
+        let changed = {
+            let mut state = lock_state();
+            let Some(s) = state.as_mut() else {
+                return;
+            };
+            let changed = s.floating_position != Some(position);
+            s.floating_position = Some(position);
+            changed
+        };
+        let _ = SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            position.0,
+            position.1,
+            width,
+            height,
+            SWP_NOACTIVATE,
+        );
+        if changed {
+            save_state_settings();
+        }
+    }
 }
 
 /// WinEvent callback for tray icon location changes
@@ -3055,7 +3328,7 @@ unsafe extern "system" fn wnd_proc(
                     schedule_countdown_timer();
                 }
                 TIMER_RAM => {
-                    // Sample only. TIMER_ANIM already repaints at ~30fps and
+                    // Sample only. TIMER_ANIM already repaints at 10fps and
                     // the paint eases toward this value, so the column drifts
                     // continuously instead of stepping on whole percents.
                     let visible = {
@@ -3117,9 +3390,11 @@ unsafe extern "system" fn wnd_proc(
                     let (index, embed, attached) = {
                         let state = lock_state();
                         match state.as_ref() {
-                            Some(s) => {
-                                (s.taskbar_index, s.embed_in_taskbar, s.taskbar_hwnd.is_some())
-                            }
+                            Some(s) => (
+                                s.taskbar_index,
+                                s.embed_in_taskbar,
+                                s.taskbar_hwnd.is_some(),
+                            ),
                             None => (0, default_embed_in_taskbar(), false),
                         }
                     };
@@ -3135,7 +3410,13 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_APP_USAGE_UPDATED => {
-            mark_poll();
+            let successful = lock_state()
+                .as_ref()
+                .map(|s| s.last_poll_ok)
+                .unwrap_or(false);
+            if successful {
+                mark_poll();
+            }
             check_theme_change();
             check_language_change();
             render_layered();
@@ -3151,6 +3432,11 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_SETCURSOR => {
+            let floating = lock_state().as_ref().map(|s| !s.embedded).unwrap_or(false);
+            if floating && (lparam.0 & 0xffff) as u32 == HTCLIENT {
+                SetCursor(LoadCursorW(HINSTANCE::default(), IDC_SIZEALL).unwrap_or_default());
+                return LRESULT(1);
+            }
             let is_dragging = {
                 let state = lock_state();
                 state.as_ref().map(|s| s.dragging).unwrap_or(false)
@@ -3167,7 +3453,45 @@ unsafe extern "system" fn wnd_proc(
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
+        WM_ENTERSIZEMOVE => {
+            if let Some(s) = lock_state().as_mut() {
+                s.dragging = true;
+            }
+            LRESULT(0)
+        }
+        WM_EXITSIZEMOVE => {
+            let rect = native_interop::get_window_rect_safe(hwnd);
+            {
+                let mut state = lock_state();
+                if let Some(s) = state.as_mut() {
+                    s.dragging = false;
+                    if !s.embedded {
+                        if let Some(rect) = rect {
+                            s.floating_position = Some((rect.left, rect.top));
+                        }
+                    }
+                }
+            }
+            position_at_taskbar();
+            save_state_settings();
+            render_layered();
+            LRESULT(0)
+        }
         WM_LBUTTONDOWN => {
+            let floating = lock_state().as_ref().map(|s| !s.embedded).unwrap_or(false);
+            if floating {
+                let _ = ReleaseCapture();
+                let mut point = POINT::default();
+                let _ = GetCursorPos(&mut point);
+                let packed = ((point.y as u16 as u32) << 16) | point.x as u16 as u32;
+                let _ = SendMessageW(
+                    hwnd,
+                    WM_NCLBUTTONDOWN,
+                    WPARAM(HTCAPTION as usize),
+                    LPARAM(packed as isize),
+                );
+                return LRESULT(0);
+            }
             let client_x = (lparam.0 & 0xFFFF) as i16 as i32;
             let client_y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
             if !is_drag_handle_point(client_x, client_y) {
@@ -3187,6 +3511,9 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
+            if lock_state().as_ref().map(|s| !s.embedded).unwrap_or(false) {
+                return DefWindowProcW(hwnd, msg, wparam, lparam);
+            }
             let is_dragging = {
                 let state = lock_state();
                 state.as_ref().map(|s| s.dragging).unwrap_or(false)
@@ -3283,6 +3610,9 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_LBUTTONUP => {
+            if lock_state().as_ref().map(|s| !s.embedded).unwrap_or(false) {
+                return DefWindowProcW(hwnd, msg, wparam, lparam);
+            }
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
             let drag_result = {
@@ -3340,6 +3670,7 @@ unsafe extern "system" fn wnd_proc(
         WM_COMMAND => {
             let id = wparam.0 as u16;
             match id {
+                IDM_APPEARANCE => crate::appearance_studio::open(hwnd),
                 1 => {
                     {
                         let mut state = lock_state();
@@ -3404,6 +3735,7 @@ unsafe extern "system" fn wnd_proc(
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
                             s.tray_offset = 0;
+                            s.floating_position = None;
                         }
                     }
                     save_state_settings();
@@ -3592,6 +3924,14 @@ fn show_context_menu(hwnd: HWND) {
         };
 
         let menu = CreatePopupMenu().unwrap();
+        let appearance_label = native_interop::wide_str("Appearance...");
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            IDM_APPEARANCE as usize,
+            PCWSTR::from_raw(appearance_label.as_ptr()),
+        );
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
 
         let refresh_str = native_interop::wide_str(strings.refresh);
         let _ = AppendMenuW(
@@ -3877,16 +4217,9 @@ fn paint(hdc: HDC, hwnd: HWND) {
     } else {
         Color::from_hex("#AAAAAA")
     };
-    let text_color = if is_dark {
-        Color::from_hex("#888888")
-    } else {
-        Color::from_hex("#404040")
-    };
-    let bg_color = if is_dark {
-        Color::from_hex("#1C1C1C")
-    } else {
-        Color::from_hex("#F3F3F3")
-    };
+    let palette = appearance().palette(is_dark);
+    let text_color = palette[1];
+    let bg_color = palette[0];
 
     unsafe {
         let mut client_rect = RECT::default();
@@ -3932,6 +4265,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
             show_antigravity,
             &codex_accent,
             &antigravity_accent,
+            fable_readout(),
         );
 
         let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
@@ -3961,7 +4295,7 @@ fn fill_box(hdc: HDC, x: i32, y: i32, w: i32, h: i32, color: &Color) {
     }
 }
 
-fn make_font(px: i32, weight: FONT_WEIGHT) -> HFONT {
+pub(crate) fn make_font(px: i32, weight: FONT_WEIGHT) -> HFONT {
     let name = native_interop::wide_str("Segoe UI");
     unsafe {
         CreateFontW(
@@ -3983,7 +4317,17 @@ fn make_font(px: i32, weight: FONT_WEIGHT) -> HFONT {
     }
 }
 
-fn draw_text_in(hdc: HDC, rect: RECT, text: &str, color: &Color, format: DRAW_TEXT_FORMAT) {
+pub(crate) fn draw_text_in(
+    hdc: HDC,
+    rect: RECT,
+    text: &str,
+    color: &Color,
+    format: DRAW_TEXT_FORMAT,
+) {
+    // DrawTextW may inspect the pointer before honoring a zero character count.
+    if text.is_empty() {
+        return;
+    }
     let mut wide: Vec<u16> = text.encode_utf16().collect();
     let mut r = rect;
     unsafe {
@@ -4051,7 +4395,9 @@ fn draw_ram_column(
             let flank = blend(centre, led.edge, 0.50);
             let half = (((w - 1) as f64) / 2.0).max(1.0);
             for c in 0..w {
-                let t = ((c as f64 - ((w - 1) as f64) / 2.0) / half).abs().clamp(0.0, 1.0);
+                let t = ((c as f64 - ((w - 1) as f64) / 2.0) / half)
+                    .abs()
+                    .clamp(0.0, 1.0);
                 fill_box(hdc, x + c, fy, 1, fill_h, &blend(centre, flank, t));
             }
 
@@ -4078,6 +4424,7 @@ fn draw_ram_column(
 /// Everything one usage row needs. Two of these per provider: the five-hour
 /// window, then the weekly one, which also carries the day band.
 struct RowDraw<'a> {
+    custom_ink: bool,
     x: i32,
     y: i32,
     shown: f64,
@@ -4121,7 +4468,9 @@ fn draw_numeric_row(
     unsafe {
         // The figure, flashed toward the state's core colour for a beat after a
         // reading lands so the change is what draws the eye, not the motion.
-        let figure = if o.is_dark {
+        let figure = if o.custom_ink {
+            o.ink
+        } else if o.is_dark {
             blend(o.ink, led.core, 0.30 + 0.60 * o.flash)
         } else {
             blend(o.ink, led.edge, 0.45 + 0.40 * o.flash)
@@ -4135,7 +4484,7 @@ fn draw_numeric_row(
                 right: o.x + sc(FIGURE_W),
                 bottom: o.y + sc(ROW_H),
             },
-            &format!("{}%", pct.round() as i32),
+            &readout::figure(pct, o.time_text),
             &figure,
             DT_LEFT | DT_VCENTER | DT_SINGLELINE,
         );
@@ -4152,16 +4501,19 @@ fn draw_numeric_row(
             RECT {
                 left: o.x + sc(TIME_DX),
                 top: o.y,
-                right: o.x + sc(PROVIDER_W),
+                right: o.x + sc(RULE_W),
                 bottom: o.y + sc(ROW_H),
             },
-            o.time_text,
+            readout::reset_label(o.time_text),
             &blend(o.ink, lift, 0.55 * o.text_tick),
             DT_LEFT | DT_VCENTER | DT_SINGLELINE,
         );
 
         // The hairline gauge.
         fill_box(hdc, o.x, ry, rule_w, thin, &o.track);
+        if !readout::has_reading(o.time_text) {
+            return;
+        }
         if fill_x > 0 {
             fill_box(
                 hdc,
@@ -4250,7 +4602,94 @@ fn draw_numeric_row(
     }
 }
 
-fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
+/// Render the real GDI widget with fixtures, without starting any live services.
+pub fn write_preview(path: &str, dark: bool, unavailable: bool) -> std::io::Result<()> {
+    CURRENT_DPI.store(192, Ordering::Relaxed);
+    RAM_SAMPLE.store(4200, Ordering::Relaxed);
+    let width = total_widget_width_for(2);
+    let height = sc(WIDGET_HEIGHT);
+    let bg = Color::from_hex(if dark { "#1C1C1C" } else { "#F3F3F3" });
+    let ink = Color::from_hex(if dark { "#D7DEE6" } else { "#252B32" });
+    let track = blend(bg, ink, 0.14);
+    let pixels = unsafe {
+        let dc = CreateCompatibleDC(None);
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: -height,
+                biPlanes: 1,
+                biBitCount: 32,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits = std::ptr::null_mut();
+        let bitmap = match CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, None, 0) {
+            Ok(bitmap) => bitmap,
+            Err(_) => {
+                let _ = DeleteDC(dc);
+                return Err(std::io::Error::other("DIB allocation failed"));
+            }
+        };
+        let old = SelectObject(dc, bitmap);
+        paint_content(
+            dc,
+            width,
+            height,
+            dark,
+            &bg,
+            &ink,
+            &claude_accent_color(),
+            &track,
+            LanguageId::English.strings(),
+            week_markers(None),
+            32.0,
+            Some(45.0),
+            "3h 12m",
+            58.0,
+            Some(65.0),
+            "4d 8h",
+            76.0,
+            if unavailable { "!" } else { "1h 42m" },
+            91.0,
+            if unavailable { "n/a" } else { "2d 6h" },
+            0.0,
+            "n/a",
+            0.0,
+            "n/a",
+            true,
+            true,
+            false,
+            &codex_accent_color(dark),
+            &antigravity_accent_color(),
+            (38.0, if unavailable { "n/a" } else { "4d 8h" }.to_owned()),
+        );
+        let _ = GdiFlush();
+        let pixels =
+            std::slice::from_raw_parts(bits as *const u8, (width * height * 4) as usize).to_vec();
+        SelectObject(dc, old);
+        let _ = DeleteObject(bitmap);
+        let _ = DeleteDC(dc);
+        pixels
+    };
+    // BITMAPFILEHEADER + BITMAPINFOHEADER, explicitly encoded to avoid struct padding.
+    let mut bmp = Vec::with_capacity(54 + pixels.len());
+    bmp.extend_from_slice(b"BM");
+    bmp.extend_from_slice(&((54 + pixels.len()) as u32).to_le_bytes());
+    bmp.extend_from_slice(&[0; 4]);
+    bmp.extend_from_slice(&54u32.to_le_bytes());
+    bmp.extend_from_slice(&40u32.to_le_bytes());
+    bmp.extend_from_slice(&width.to_le_bytes());
+    bmp.extend_from_slice(&(-height).to_le_bytes());
+    bmp.extend_from_slice(&1u16.to_le_bytes());
+    bmp.extend_from_slice(&32u16.to_le_bytes());
+    bmp.extend_from_slice(&[0; 24]);
+    bmp.extend_from_slice(&pixels);
+    std::fs::write(path, bmp)
+}
+
+pub(crate) fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
     unsafe {
         let brush = CreateSolidBrush(COLORREF(color.to_colorref()));
         let rgn = CreateRoundRectRgn(

@@ -256,12 +256,16 @@ pub fn create_icon(kind: TrayIconKind, percent: Option<f64>) -> HICON {
             bottom: size - margin,
         };
         let mut text_wide: Vec<u16> = display_text.encode_utf16().collect();
-        let _ = DrawTextW(
-            mem_dc,
-            &mut text_wide,
-            &mut text_rect,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-        );
+        // An empty Vec has a dangling pointer (0x2 for u16). USER32 can
+        // dereference it even with a zero count, so never pass empty text.
+        if !text_wide.is_empty() {
+            let _ = DrawTextW(
+                mem_dc,
+                &mut text_wide,
+                &mut text_rect,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+            );
+        }
 
         SelectObject(mem_dc, old_font);
         let _ = DeleteObject(font);
@@ -299,6 +303,30 @@ pub fn create_icon(kind: TrayIconKind, percent: Option<f64>) -> HICON {
         ReleaseDC(HWND::default(), screen_dc);
 
         hicon
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loading_and_zero_usage_icons_are_safe() {
+        // A test executable has no embedded application icon, exercising the
+        // empty-label Claude fallback that crashed normal startup.
+        for kind in [
+            TrayIconKind::Claude,
+            TrayIconKind::Codex,
+            TrayIconKind::Antigravity,
+        ] {
+            for percentage in [None, Some(0.0), Some(100.0)] {
+                let icon = create_icon(kind, percentage);
+                assert!(!icon.is_invalid());
+                unsafe {
+                    let _ = DestroyIcon(icon);
+                }
+            }
+        }
     }
 }
 
