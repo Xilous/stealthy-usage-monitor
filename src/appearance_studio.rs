@@ -1,6 +1,9 @@
 //! Native, keyboard-accessible appearance controls with an immediate color preview.
 use crate::{
-    appearance::{color, Appearance, Mode, PRESETS},
+    appearance::{
+        color, snap_widget_size, Appearance, Mode, PRESETS, WIDGET_SIZE_MAX, WIDGET_SIZE_MIN,
+        WIDGET_SIZE_STEP,
+    },
     native_interop::{wide_str, Color},
     theme, window,
 };
@@ -8,7 +11,7 @@ use std::sync::{
     atomic::{AtomicIsize, Ordering},
     Mutex,
 };
-use window::{draw_rounded_rect, draw_text_in, make_font, sc};
+use window::{create_font, dpi_sc as sc, draw_rounded_rect, draw_text_in};
 use windows::core::PCWSTR;
 use windows::Win32::{
     Foundation::*,
@@ -20,6 +23,11 @@ use windows::Win32::{
 static STUDIO: AtomicIsize = AtomicIsize::new(0);
 static ORIGINAL: Mutex<Option<Appearance>> = Mutex::new(None);
 static PICKER: Mutex<Option<Picker>> = Mutex::new(None);
+static SLIDER: AtomicIsize = AtomicIsize::new(0);
+static SLIDER_BRUSH: AtomicIsize = AtomicIsize::new(0);
+const SLIDER_ID: u16 = 140;
+/// Not exported by the windows crate; TBM_GETPOS is WM_USER.
+const TBM_GETPOS: u32 = WM_USER;
 const MODES: [&str; 4] = ["System", "Light", "Dark", "Custom"];
 const FIELDS: [&str; 5] = ["Background", "Text", "Claude", "Codex", "Antigravity"];
 const MODE_VALUES: [Mode; 4] = [Mode::System, Mode::Light, Mode::Dark, Mode::Custom];
@@ -36,7 +44,7 @@ fn rect(x: i32, y: i32, w: i32, h: i32) -> RECT {
 fn label(dc: HDC, r: RECT, value: &str, rgb: u32, size: i32, weight: FONT_WEIGHT) {
     unsafe {
         let _ = SetBkMode(dc, TRANSPARENT);
-        let font = make_font(-size, weight);
+        let font = create_font(sc(-size), weight);
         let old = SelectObject(dc, font);
         draw_text_in(
             dc,
@@ -72,7 +80,7 @@ pub fn open(owner: HWND) {
         let _ = RegisterClassW(&wc);
         let title = wide_str("Appearance Studio");
         let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN;
-        let mut bounds = rect(0, 0, 488, 602);
+        let mut bounds = rect(0, 0, 488, 680);
         let _ = AdjustWindowRectEx(&mut bounds, style, false, WS_EX_TOOLWINDOW);
         let mut point = POINT::default();
         let _ = GetCursorPos(&mut point);
@@ -126,9 +134,10 @@ pub fn open(owner: HWND) {
                 rect(24 + i as i32 * 90, 442, 80, 68),
             );
         }
-        button(hwnd, 130, "Reset", rect(24, 548, 76, 32));
-        button(hwnd, 131, "Undo changes", rect(110, 548, 124, 32));
-        button(hwnd, 132, "Done", rect(356, 548, 108, 32));
+        slider(hwnd, rect(112, 572, 288, 32));
+        button(hwnd, 130, "Reset", rect(24, 626, 76, 32));
+        button(hwnd, 131, "Undo changes", rect(110, 626, 124, 32));
+        button(hwnd, 132, "Done", rect(356, 626, 108, 32));
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
         let _ = SendMessageW(hwnd, WM_NEXTDLGCTL, WPARAM(0), LPARAM(0));
@@ -152,6 +161,51 @@ unsafe fn button(parent: HWND, id: u16, text: &str, r: RECT) {
         GetModuleHandleW(None).unwrap(),
         None,
     );
+}
+
+/// The WIDGET SIZE trackbar: 75% to 200% in 5% steps from the arrow keys and
+/// PageUp/PageDown, with a tick every 25%.
+unsafe fn slider(parent: HWND, r: RECT) {
+    let controls = INITCOMMONCONTROLSEX {
+        dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
+        dwICC: ICC_BAR_CLASSES,
+    };
+    let _ = InitCommonControlsEx(&controls);
+    let name = wide_str("Widget size");
+    let Ok(hwnd) = CreateWindowExW(
+        WINDOW_EX_STYLE(0),
+        TRACKBAR_CLASSW,
+        PCWSTR(name.as_ptr()),
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(TBS_HORZ | TBS_BOTTOM | TBS_AUTOTICKS),
+        r.left,
+        r.top,
+        r.right - r.left,
+        r.bottom - r.top,
+        parent,
+        HMENU(SLIDER_ID as usize as *mut _),
+        GetModuleHandleW(None).unwrap(),
+        None,
+    ) else {
+        return;
+    };
+    let range = (WIDGET_SIZE_MAX << 16 | WIDGET_SIZE_MIN) as isize;
+    let _ = SendMessageW(hwnd, TBM_SETRANGE, WPARAM(0), LPARAM(range));
+    let step = LPARAM(WIDGET_SIZE_STEP as isize);
+    let _ = SendMessageW(hwnd, TBM_SETLINESIZE, WPARAM(0), step);
+    let _ = SendMessageW(hwnd, TBM_SETPAGESIZE, WPARAM(0), step);
+    let _ = SendMessageW(hwnd, TBM_SETTICFREQ, WPARAM(25), LPARAM(0));
+    SLIDER.store(hwnd.0 as isize, Ordering::Relaxed);
+    sync_slider();
+}
+
+/// Move the thumb to the live WIDGET SIZE, e.g. after Reset or Undo changes.
+/// TBM_SETPOS sends no WM_HSCROLL, so this never feeds back into a change.
+unsafe fn sync_slider() {
+    let slider = SLIDER.load(Ordering::Relaxed);
+    if slider != 0 {
+        let position = LPARAM(window::appearance().clamped_widget_size() as isize);
+        let _ = SendMessageW(HWND(slider as *mut _), TBM_SETPOS, WPARAM(1), position);
+    }
 }
 
 pub fn translate(msg: &MSG) -> bool {
@@ -331,8 +385,42 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 }
                 _ => {}
             }
+            sync_slider();
             let _ = RedrawWindow(hwnd, None, None, RDW_INVALIDATE | RDW_ALLCHILDREN);
             LRESULT(0)
+        }
+        // Every step while dragging resizes the real widget, not just on release.
+        WM_HSCROLL => {
+            let slider = SLIDER.load(Ordering::Relaxed);
+            if slider != 0 && lp.0 == slider {
+                let slider = HWND(slider as *mut _);
+                let position = SendMessageW(slider, TBM_GETPOS, WPARAM(0), LPARAM(0)).0;
+                let widget_size = snap_widget_size(position as f64);
+                if position != widget_size as isize {
+                    let snapped = LPARAM(widget_size as isize);
+                    let _ = SendMessageW(slider, TBM_SETPOS, WPARAM(1), snapped);
+                }
+                let mut appearance = window::appearance();
+                if appearance.widget_size != widget_size {
+                    appearance.widget_size = widget_size;
+                    window::set_appearance(appearance);
+                    let readout = rect(408, 572, 56, 32);
+                    let _ = InvalidateRect(hwnd, Some(&readout as *const _), false);
+                }
+            }
+            LRESULT(0)
+        }
+        // The trackbar asks its parent for the brush behind its channel.
+        WM_CTLCOLORSTATIC => {
+            let dc = HDC(wp.0 as *mut _);
+            let _ = SetBkColor(dc, COLORREF(color(0x11151e).to_colorref()));
+            let _ = SetTextColor(dc, COLORREF(color(0x9ca8bc).to_colorref()));
+            let mut brush = SLIDER_BRUSH.load(Ordering::Relaxed);
+            if brush == 0 {
+                brush = CreateSolidBrush(COLORREF(color(0x11151e).to_colorref())).0 as isize;
+                SLIDER_BRUSH.store(brush, Ordering::Relaxed);
+            }
+            LRESULT(brush)
         }
         WM_CLOSE => {
             let _ = DestroyWindow(hwnd);
@@ -340,6 +428,11 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         }
         WM_DESTROY => {
             STUDIO.store(0, Ordering::Relaxed);
+            SLIDER.store(0, Ordering::Relaxed);
+            let brush = SLIDER_BRUSH.swap(0, Ordering::Relaxed);
+            if brush != 0 {
+                let _ = DeleteObject(HBRUSH(brush as *mut _));
+            }
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
@@ -347,7 +440,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
 }
 
 fn paint(dc: HDC) {
-    draw_rounded_rect(dc, &rect(0, 0, 488, 602), &color(0x11151e), 0);
+    draw_rounded_rect(dc, &rect(0, 0, 488, 680), &color(0x11151e), 0);
     label(
         dc,
         rect(24, 20, 440, 36),
@@ -442,7 +535,31 @@ fn paint(dc: HDC) {
     );
     label(
         dc,
-        rect(246, 555, 100, 18),
+        rect(24, 548, 440, 18),
+        "04  /  WIDGET SIZE",
+        0x9ca8bc,
+        10,
+        FW_SEMIBOLD,
+    );
+    label(
+        dc,
+        rect(24, 572, 86, 32),
+        "Widget size",
+        0xe8edf6,
+        12,
+        FW_SEMIBOLD,
+    );
+    label(
+        dc,
+        rect(408, 572, 56, 32),
+        &format!("{}%", appearance.clamped_widget_size()),
+        0xf2f4fa,
+        12,
+        FW_SEMIBOLD,
+    );
+    label(
+        dc,
+        rect(246, 633, 100, 18),
         "Saved as you go",
         0x9ca8bc,
         10,
