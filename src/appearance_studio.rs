@@ -19,6 +19,7 @@ use windows::Win32::{
 
 static STUDIO: AtomicIsize = AtomicIsize::new(0);
 static ORIGINAL: Mutex<Option<Appearance>> = Mutex::new(None);
+static PICKER: Mutex<Option<Picker>> = Mutex::new(None);
 const MODES: [&str; 4] = ["System", "Light", "Dark", "Custom"];
 const FIELDS: [&str; 5] = ["Background", "Text", "Claude", "Codex", "Antigravity"];
 const MODE_VALUES: [Mode; 4] = [Mode::System, Mode::Light, Mode::Dark, Mode::Custom];
@@ -171,8 +172,74 @@ pub fn translate(msg: &MSG) -> bool {
     }
 }
 
+struct Picker {
+    base: Appearance,
+    index: usize,
+    last: u32,
+    ready: bool,
+}
+
+fn bgr_to_rgb(bgr: u32) -> u32 {
+    (bgr & 255) << 16 | (bgr & 0xff00) | ((bgr >> 16) & 255)
+}
+
+// The full-open dialog's H/S/L edits, spectrum, and swatches all rewrite its RGB edits,
+// control IDs 706-708 (COLOR_RED..COLOR_BLUE in colordlg.h).
+unsafe extern "system" fn picker_hook(dialog: HWND, msg: u32, wp: WPARAM, _lp: LPARAM) -> usize {
+    match msg {
+        WM_INITDIALOG => {
+            if let Some(p) = PICKER.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                p.ready = true;
+            }
+            1
+        }
+        WM_COMMAND
+            if (wp.0 >> 16) & 0xffff == EN_CHANGE as usize
+                && (706..=708).contains(&(wp.0 & 0xffff)) =>
+        {
+            preview_picked(dialog);
+            0
+        }
+        _ => 0,
+    }
+}
+
+unsafe fn preview_picked(dialog: HWND) {
+    let mut bgr = 0;
+    for (i, id) in (706..=708).enumerate() {
+        let mut translated = BOOL(0);
+        let value = GetDlgItemInt(dialog, id, Some(&mut translated as *mut BOOL), false);
+        if !translated.as_bool() {
+            return;
+        }
+        bgr |= value.min(255) << (i * 8);
+    }
+    let next = {
+        let mut picker = PICKER.lock().unwrap_or_else(|e| e.into_inner());
+        let p = match picker.as_mut() {
+            Some(p) if p.ready && p.last != bgr => p,
+            _ => return,
+        };
+        p.last = bgr;
+        let mut next = p.base.clone();
+        next.colors[p.index] = bgr_to_rgb(bgr);
+        next
+    };
+    window::preview_appearance(next);
+    let studio = STUDIO.load(Ordering::Relaxed);
+    if studio != 0 {
+        let _ = RedrawWindow(
+            HWND(studio as *mut _),
+            None,
+            None,
+            RDW_INVALIDATE | RDW_ALLCHILDREN,
+        );
+    }
+}
+
 unsafe fn choose_color(hwnd: HWND, index: usize) {
-    let mut appearance = window::appearance();
+    let original = window::appearance();
+    let mut appearance = original.clone();
     if appearance.mode != Mode::Custom {
         let palette = appearance.palette(appearance.is_dark(theme::is_dark_mode()));
         appearance.colors = palette.map(|c| (c.r as u32) << 16 | (c.g as u32) << 8 | c.b as u32);
@@ -188,20 +255,32 @@ unsafe fn choose_color(hwnd: HWND, index: usize) {
         hwndOwner: hwnd,
         rgbResult: COLORREF(color(appearance.colors[index]).to_colorref()),
         lpCustColors: custom.as_mut_ptr(),
-        Flags: CC_FULLOPEN | CC_RGBINIT,
+        Flags: CC_FULLOPEN | CC_RGBINIT | CC_ENABLEHOOK,
+        lpfnHook: Some(picker_hook),
         ..Default::default()
     };
+    let mut base = appearance.clone();
+    base.mode = Mode::Custom;
+    *PICKER.lock().unwrap_or_else(|e| e.into_inner()) = Some(Picker {
+        base,
+        index,
+        last: chooser.rgbResult.0,
+        ready: false,
+    });
     // No application locks held across the modal dialog's nested message loop.
     let accepted = ChooseColorW(&mut chooser).as_bool();
+    *PICKER.lock().unwrap_or_else(|e| e.into_inner()) = None;
     crate::diagnose::log(format!(
         "appearance picker accepted={accepted} color={:06X}",
         chooser.rgbResult.0
     ));
     if accepted {
-        let bgr = chooser.rgbResult.0;
-        appearance.colors[index] = (bgr & 255) << 16 | (bgr & 0xff00) | ((bgr >> 16) & 255);
+        appearance.colors[index] = bgr_to_rgb(chooser.rgbResult.0);
         appearance.mode = Mode::Custom;
         window::set_appearance(appearance);
+    } else {
+        // Re-save: another path (a drag, an update check) may have written the preview meanwhile.
+        window::set_appearance(original);
     }
 }
 
