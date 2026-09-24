@@ -19,7 +19,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::appearance::{Appearance, Mode};
+use crate::appearance::{Appearance, Mode, WIDGET_SIZE_DEFAULT};
 use crate::diagnose;
 use crate::localization::{self, Strings};
 use crate::models::{AppUsageData, UsageData};
@@ -143,10 +143,31 @@ static SUPPRESS_TRAY_REPOSITION_UNTIL: Mutex<Option<Instant>> = Mutex::new(None)
 /// Current system DPI (96 = 100% scaling, 144 = 150%, 192 = 200%, etc.)
 static CURRENT_DPI: AtomicU32 = AtomicU32::new(96);
 
-/// Scale a base pixel value (designed at 96 DPI) to the current DPI.
-pub(crate) fn sc(px: i32) -> i32 {
-    let dpi = CURRENT_DPI.load(Ordering::Relaxed);
-    (px as f64 * dpi as f64 / 96.0).round() as i32
+/// WIDGET SIZE in whole percent, mirrored from the appearance so the widget's
+/// geometry can be scaled without taking the state lock. Anything that never
+/// sets it, such as `write_preview`, renders at 100%.
+static WIDGET_SIZE: AtomicU32 = AtomicU32::new(WIDGET_SIZE_DEFAULT);
+
+/// Scale a base pixel value (designed at 96 DPI and 100% WIDGET SIZE).
+fn scale_px(px: i32, dpi: u32, widget_size: u32) -> i32 {
+    (px as f64 * dpi as f64 / 96.0 * widget_size as f64 / 100.0).round() as i32
+}
+
+/// Scale a base pixel value to the current DPI only. For everything that is
+/// not the floating widget (the appearance studio), which WIDGET SIZE leaves
+/// alone.
+pub(crate) fn dpi_sc(px: i32) -> i32 {
+    scale_px(px, CURRENT_DPI.load(Ordering::Relaxed), WIDGET_SIZE_DEFAULT)
+}
+
+/// Scale a base pixel value of the widget to the current DPI and WIDGET SIZE.
+/// Every widget size, gap, font and hit-test goes through this.
+fn widget_sc(px: i32) -> i32 {
+    scale_px(
+        px,
+        CURRENT_DPI.load(Ordering::Relaxed),
+        WIDGET_SIZE.load(Ordering::Relaxed),
+    )
 }
 
 /// Re-query the monitor DPI for our window and update the cached value.
@@ -1306,10 +1327,10 @@ fn pace_marker_color(is_dark: bool) -> Color {
 }
 
 fn is_drag_handle_point(client_x: i32, client_y: i32) -> bool {
-    let divider_h = sc(25);
-    let divider_top = (sc(WIDGET_HEIGHT) - divider_h) / 2;
+    let divider_h = widget_sc(25);
+    let divider_top = (widget_sc(WIDGET_HEIGHT) - divider_h) / 2;
     client_x >= 0
-        && client_x < sc(LEFT_DIVIDER_W)
+        && client_x < widget_sc(LEFT_DIVIDER_W)
         && client_y >= divider_top
         && client_y < divider_top + divider_h
 }
@@ -1374,11 +1395,22 @@ fn last_ram_sample() -> f64 {
 }
 
 fn provider_slot_width() -> i32 {
-    sc(PROVIDER_W) + sc(PROVIDER_GAP)
+    widget_sc(PROVIDER_W) + widget_sc(PROVIDER_GAP)
+}
+
+/// Widget width for a model count at a given DPI and WIDGET SIZE, the same
+/// sum `provider_slot_width` and the paint use, at explicit values.
+fn widget_width_at(active_models: i32, dpi: u32, widget_size: u32) -> i32 {
+    let s = |px| scale_px(px, dpi, widget_size);
+    s(CONTENT_X) + (s(PROVIDER_W) + s(PROVIDER_GAP)) * active_models - s(PROVIDER_GAP)
 }
 
 fn total_widget_width_for(active_models: i32) -> i32 {
-    sc(CONTENT_X) + provider_slot_width() * active_models - sc(PROVIDER_GAP)
+    widget_width_at(
+        active_models,
+        CURRENT_DPI.load(Ordering::Relaxed),
+        WIDGET_SIZE.load(Ordering::Relaxed),
+    )
 }
 
 fn total_widget_width_for_state(state: &AppState) -> i32 {
@@ -1786,6 +1818,11 @@ pub fn run() {
             settings.show_antigravity = false;
         }
         let install_channel = updater::current_install_channel();
+        // Before the window is created, so its very first size is right.
+        WIDGET_SIZE.store(
+            settings.appearance.clamped_widget_size(),
+            Ordering::Relaxed,
+        );
 
         // Create as layered popup (will be reparented into taskbar)
         let title = native_interop::wide_str(localization::STRINGS.window_title);
@@ -1810,7 +1847,7 @@ pub fn run() {
             0,
             0,
             total_widget_width_for(initial_model_count),
-            sc(WIDGET_HEIGHT),
+            widget_sc(WIDGET_HEIGHT),
             HWND::default(),
             HMENU::default(),
             hinstance,
@@ -2100,7 +2137,7 @@ fn render_layered() {
     }
 
     let width = total_widget_width();
-    let height = sc(WIDGET_HEIGHT);
+    let height = widget_sc(WIDGET_HEIGHT);
 
     let accent = claude_accent_color();
     let codex_accent = codex_accent_color(is_dark);
@@ -2323,7 +2360,7 @@ fn paint_content(
         let _ = DeleteObject(bg_brush);
 
         // Drag handle, unchanged: two hairlines the width of the grab area.
-        let divider_h = sc(25);
+        let divider_h = widget_sc(25);
         let divider_top = (height - divider_h) / 2;
         let (div_left, div_right) = if is_dark {
             ((80, 80, 80), (40, 40, 40))
@@ -2336,7 +2373,7 @@ fn paint_content(
         let left_rect = RECT {
             left: 0,
             top: divider_top,
-            right: sc(2),
+            right: widget_sc(2),
             bottom: divider_top + divider_h,
         };
         FillRect(hdc, &left_rect, left_brush);
@@ -2347,9 +2384,9 @@ fn paint_content(
             div_right.2,
         )));
         let right_rect = RECT {
-            left: sc(2),
+            left: widget_sc(2),
             top: divider_top,
-            right: sc(3),
+            right: widget_sc(3),
             bottom: divider_top + divider_h,
         };
         FillRect(hdc, &right_rect, right_brush);
@@ -2359,7 +2396,7 @@ fn paint_content(
 
         draw_ram_column(
             hdc,
-            sc(RAM_X),
+            widget_sc(RAM_X),
             frame.ram,
             frame.ram_lo,
             frame.ram_hi,
@@ -2398,12 +2435,12 @@ fn paint_content(
             ),
         ];
 
-        let mut x = sc(CONTENT_X);
+        let mut x = widget_sc(CONTENT_X);
         for (visible, base, idx, ident_color, _blocks) in providers {
             if !visible {
                 continue;
             }
-            let tx = x + sc(LABEL_W);
+            let tx = x + widget_sc(LABEL_W);
             let ink = palette[1];
             let base = if custom {
                 Led {
@@ -2420,22 +2457,22 @@ fn paint_content(
                 hdc,
                 &RECT {
                     left: x,
-                    top: sc(1),
-                    right: x + sc(PROVIDER_W),
-                    bottom: height - sc(1),
+                    top: widget_sc(1),
+                    right: x + widget_sc(PROVIDER_W),
+                    bottom: height - widget_sc(1),
                 },
                 &card,
-                sc(4),
+                widget_sc(4),
             );
-            fill_box(hdc, x + sc(6), sc(5), sc(3), sc(3), &ident_color);
+            fill_box(hdc, x + widget_sc(6), widget_sc(5), widget_sc(3), widget_sc(3), &ident_color);
             SelectObject(hdc, day_font_bold);
             draw_text_in(
                 hdc,
                 RECT {
-                    left: x + sc(13),
-                    top: sc(1),
-                    right: x + sc(83),
-                    bottom: sc(12),
+                    left: x + widget_sc(13),
+                    top: widget_sc(1),
+                    right: x + widget_sc(83),
+                    bottom: widget_sc(12),
                 },
                 match idx {
                     0 => "CLAUDE",
@@ -2449,10 +2486,10 @@ fn paint_content(
             draw_text_in(
                 hdc,
                 RECT {
-                    left: x + sc(86),
-                    top: sc(1),
-                    right: x + sc(PROVIDER_W - 8),
-                    bottom: sc(12),
+                    left: x + widget_sc(86),
+                    top: widget_sc(1),
+                    right: x + widget_sc(PROVIDER_W - 8),
+                    bottom: widget_sc(12),
                 },
                 "USED / RESET IN",
                 &blend(card, ink, 0.65),
@@ -2461,20 +2498,20 @@ fn paint_content(
 
             let rows = [
                 (
-                    sc(ROW1_Y),
+                    widget_sc(ROW1_Y),
                     idx,
                     if idx == 0 { session_pace } else { None },
                     None,
                 ),
                 (
-                    sc(ROW2_Y),
+                    widget_sc(ROW2_Y),
                     idx + 1,
                     if idx == 0 { weekly_pace } else { None },
                     None,
                 ),
             ];
             let rows = rows.into_iter().chain(
-                (idx == 0).then_some((sc(45), 6, None, None)),
+                (idx == 0).then_some((widget_sc(45), 6, None, None)),
             );
             for (row_y, slot, pace, week_blocks) in rows {
                 // Codex displays only its general weekly quota, not Spark's 5h limit.
@@ -2482,7 +2519,7 @@ fn paint_content(
                     continue;
                 }
                 let row_y = if idx == 2 {
-                    sc((ROW1_Y + ROW2_Y) / 2)
+                    widget_sc((ROW1_Y + ROW2_Y) / 2)
                 } else {
                     row_y
                 };
@@ -2490,10 +2527,10 @@ fn paint_content(
                 draw_text_in(
                     hdc,
                     RECT {
-                        left: x + sc(6),
+                        left: x + widget_sc(6),
                         top: row_y,
-                        right: tx - sc(3),
-                        bottom: row_y + sc(ROW_H),
+                        right: tx - widget_sc(3),
+                        bottom: row_y + widget_sc(ROW_H),
                     },
                     &labels[slot],
                     &blend(card, ink, 0.65),
@@ -2539,8 +2576,8 @@ fn paint_content(
         // says how stale the figures below it are, and it puts your eye on the
         // row a moment before the count-up fires. It sits at the top because
         // the bottom of the widget belongs to the day band.
-        let thin = sc(1).max(1);
-        let x0 = sc(CONTENT_X);
+        let thin = widget_sc(1).max(1);
+        let x0 = widget_sc(CONTENT_X);
         let x1 = width - thin;
         if x1 > x0 {
             let y = 0;
@@ -2846,9 +2883,30 @@ fn store_appearance(value: Appearance) {
     }
 }
 
-pub(crate) fn set_appearance(value: Appearance) {
+pub(crate) fn set_appearance(mut value: Appearance) {
+    value.widget_size = value.clamped_widget_size();
+    let resized = WIDGET_SIZE.swap(value.widget_size, Ordering::Relaxed) != value.widget_size;
+    if resized {
+        // Resizing keeps the widget's top-left corner where it is. A widget
+        // that was never dragged has no saved spot, and the default top-right
+        // placement is measured from the right edge, so pin where it sits now.
+        let unsaved = lock_state()
+            .as_ref()
+            .filter(|s| !s.embedded && s.floating_position.is_none())
+            .map(|s| s.hwnd.to_hwnd());
+        if let Some(rect) = unsaved.and_then(native_interop::get_window_rect_safe) {
+            if let Some(s) = lock_state().as_mut() {
+                s.floating_position.get_or_insert((rect.left, rect.top));
+            }
+        }
+    }
     store_appearance(value);
     save_state_settings();
+    if resized {
+        // Clamps the kept corner into the monitor's work area and saves the
+        // result, the same path a finished drag takes.
+        position_at_taskbar();
+    }
     render_layered();
 }
 
@@ -2967,7 +3025,7 @@ fn position_at_taskbar() {
         save_state_settings();
     }
 
-    let widget_height = sc(WIDGET_HEIGHT);
+    let widget_height = widget_sc(WIDGET_HEIGHT);
     let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
     if embedded {
         // Child window: coordinates relative to parent (taskbar)
@@ -3039,6 +3097,16 @@ mod desktop_tests {
     }
 
     #[test]
+    fn widget_size_scales_widget_dimensions_on_top_of_dpi() {
+        assert_eq!(scale_px(WIDGET_HEIGHT, 96, 100), 62);
+        assert_eq!(scale_px(WIDGET_HEIGHT, 96, 200), 124);
+        assert_eq!(scale_px(WIDGET_HEIGHT, 144, 200), 186);
+        assert_eq!(widget_width_at(2, 96, 100), 384);
+        assert_eq!(widget_width_at(2, 96, 200), 768);
+        assert_eq!(widget_width_at(1, 192, 100), widget_width_at(1, 96, 200));
+    }
+
+    #[test]
     fn old_settings_migrate_without_losing_provider_choices() {
         let mut settings: SettingsFile = serde_json::from_str(r#"{"embed_in_taskbar":true,"click_through":true,"show_claude_code":false,"show_codex":true}"#).unwrap();
         migrate_desktop_settings(&mut settings);
@@ -3077,7 +3145,7 @@ fn position_floating_widget() {
             total_widget_width_for_state(s),
         )
     };
-    let height = sc(WIDGET_HEIGHT);
+    let height = widget_sc(WIDGET_HEIGHT);
     let (x, y) = saved.unwrap_or((0, 0));
     unsafe {
         let monitor = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
@@ -3088,8 +3156,10 @@ fn position_floating_widget() {
         if !GetMonitorInfoW(monitor, &mut info).as_bool() {
             return;
         }
-        let (x, y) =
-            saved.unwrap_or((info.rcWork.right - width - sc(16), info.rcWork.top + sc(16)));
+        let (x, y) = saved.unwrap_or((
+            info.rcWork.right - width - dpi_sc(16),
+            info.rcWork.top + dpi_sc(16),
+        ));
         let position = clamp_desktop_position(x, y, width, height, info.rcWork);
         let changed = {
             let mut state = lock_state();
@@ -3512,7 +3582,7 @@ unsafe extern "system" fn wnd_proc(
                             let taskbar_height = taskbar_rect.bottom - taskbar_rect.top;
                             let anchor_top = taskbar_rect.top;
                             let anchor_height = taskbar_height;
-                            let widget_height = sc(WIDGET_HEIGHT);
+                            let widget_height = widget_sc(WIDGET_HEIGHT);
                             let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
                             let x = if embedded {
                                 tray_left - taskbar_rect.left - widget_width - new_offset
@@ -4147,11 +4217,18 @@ fn fill_box(hdc: HDC, x: i32, y: i32, w: i32, h: i32, color: &Color) {
     }
 }
 
-pub(crate) fn make_font(px: i32, weight: FONT_WEIGHT) -> HFONT {
+/// A widget font, `px` designed at 96 DPI and 100% WIDGET SIZE.
+fn make_font(px: i32, weight: FONT_WEIGHT) -> HFONT {
+    create_font(widget_sc(px), weight)
+}
+
+/// A Segoe UI font at an already-scaled height, for callers that scale
+/// themselves (the appearance studio uses `dpi_sc`).
+pub(crate) fn create_font(height: i32, weight: FONT_WEIGHT) -> HFONT {
     let name = native_interop::wide_str("Segoe UI");
     unsafe {
         CreateFontW(
-            sc(px),
+            height,
             0,
             0,
             0,
@@ -4209,16 +4286,16 @@ fn draw_ram_column(
     let percent = percent.clamp(0.0, 100.0);
     let led = ram_led(percent);
     let track = ram_track_color(is_dark);
-    let w = sc(RAM_W).max(3);
-    let h = sc(RAM_H);
-    let y = sc(RAM_Y);
+    let w = widget_sc(RAM_W).max(3);
+    let h = widget_sc(RAM_H);
+    let y = widget_sc(RAM_Y);
     let radius = w / 2;
     let fill_h = ((h as f64) * percent / 100.0).round() as i32;
 
     unsafe {
         if breath > 0.02 && fill_h > 0 {
             for i in (1..=2).rev() {
-                let grow = sc(i);
+                let grow = widget_sc(i);
                 let a = 0.18 * breath * (1.0 - (i as f64 - 1.0) / 2.0);
                 let rect = RECT {
                     left: x - grow,
@@ -4259,16 +4336,16 @@ fn draw_ram_column(
             // Bright cap riding the head, so the level is findable at a glance
             // however dark the body of the fill has gone.
             let cap = blend(led.core, led.glow, 0.20 + 0.40 * breath);
-            fill_box(hdc, x, fy, w, sc(1).max(1), &cap);
+            fill_box(hdc, x, fy, w, widget_sc(1).max(1), &cap);
         }
 
         // The range the reading has been moving through, as two ticks beside
         // the column so they cannot be read as part of the level itself.
         let tick = blend(*bg, led.mid, 0.45);
-        let thin = sc(1).max(1);
+        let thin = widget_sc(1).max(1);
         for v in [lo, hi] {
             let ty = y + h - ((h as f64) * v.clamp(0.0, 100.0) / 100.0).round() as i32;
-            fill_box(hdc, x - sc(2), ty, thin, thin, &tick);
+            fill_box(hdc, x - widget_sc(2), ty, thin, thin, &tick);
         }
     }
 }
@@ -4312,9 +4389,9 @@ fn draw_numeric_row(
     let pct = o.shown.clamp(0.0, 100.0);
     let burn = o.pace.map(|p| pct - p).unwrap_or(0.0);
     let led = state_led(pct, burn, &o.base);
-    let rule_w = sc(RULE_W);
-    let ry = o.y + sc(RULE_DY);
-    let thin = sc(1).max(1);
+    let rule_w = widget_sc(RULE_W);
+    let ry = o.y + widget_sc(RULE_DY);
+    let thin = widget_sc(1).max(1);
     let fill_x = ((rule_w as f64) * pct / 100.0).round() as i32;
 
     unsafe {
@@ -4333,8 +4410,8 @@ fn draw_numeric_row(
             RECT {
                 left: o.x,
                 top: o.y,
-                right: o.x + sc(FIGURE_W),
-                bottom: o.y + sc(ROW_H),
+                right: o.x + widget_sc(FIGURE_W),
+                bottom: o.y + widget_sc(ROW_H),
             },
             &readout::figure(pct, o.time_text),
             &figure,
@@ -4351,10 +4428,10 @@ fn draw_numeric_row(
         draw_text_in(
             hdc,
             RECT {
-                left: o.x + sc(TIME_DX),
+                left: o.x + widget_sc(TIME_DX),
                 top: o.y,
-                right: o.x + sc(RULE_W),
-                bottom: o.y + sc(ROW_H),
+                right: o.x + widget_sc(RULE_W),
+                bottom: o.y + widget_sc(ROW_H),
             },
             readout::reset_label(o.time_text),
             &blend(o.ink, lift, 0.55 * o.text_tick),
@@ -4423,8 +4500,8 @@ fn draw_numeric_row(
         // The day band. Seven initials under the weekly rule, the last of them
         // the day the quota resets on; today is bold and lit, and breathes.
         if let Some(week) = o.week {
-            let band_y = o.y + sc(DAY_DY);
-            let band_h = sc(DAY_BAND_H);
+            let band_y = o.y + widget_sc(DAY_DY);
+            let band_h = widget_sc(DAY_BAND_H);
             let quiet = blend(o.bg, o.ink, 0.72);
             for d in 0..WEEKLY_BLOCKS {
                 let left = o.x + ((rule_w as f64) * d as f64 / WEEKLY_BLOCKS as f64).round() as i32;
@@ -4457,9 +4534,10 @@ fn draw_numeric_row(
 /// Render the real GDI widget with fixtures, without starting any live services.
 pub fn write_preview(path: &str, dark: bool, unavailable: bool) -> std::io::Result<()> {
     CURRENT_DPI.store(192, Ordering::Relaxed);
+    WIDGET_SIZE.store(WIDGET_SIZE_DEFAULT, Ordering::Relaxed);
     RAM_SAMPLE.store(4200, Ordering::Relaxed);
     let width = total_widget_width_for(2);
-    let height = sc(WIDGET_HEIGHT);
+    let height = widget_sc(WIDGET_HEIGHT);
     let bg = Color::from_hex(if dark { "#1C1C1C" } else { "#F3F3F3" });
     let ink = Color::from_hex(if dark { "#D7DEE6" } else { "#252B32" });
     let track = blend(bg, ink, 0.14);

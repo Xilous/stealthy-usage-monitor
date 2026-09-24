@@ -59,21 +59,27 @@ Right-click the widget or tray icon and choose **Appearance...**. The studio
 provides System, Light, Dark and Custom modes; Midnight, Porcelain, Evergreen
 and Afterglow palettes; and native RGB color pickers for the background, text
 and three provider accents. Clicking a swatch switches to Custom only when a
-color is confirmed. Cancel leaves the current appearance unchanged.
+color is confirmed. Cancel leaves the current appearance unchanged. The
+**Widget size** slider makes the widget larger or smaller, from 75% to 200% in
+5% steps, and the widget resizes live as you drag, keeping its top-left corner
+in place.
 
 Changes update the widget immediately and persist automatically. The studio's
 preview uses explicitly labelled sample usage. **Undo changes** restores the
-appearance from when the studio opened; **Reset** restores System mode and the
-default custom palette. **Done**, Escape or the close button closes the studio
-without quitting the monitor. Controls support Tab and Space. High-usage warning
+appearance from when the studio opened; **Reset** restores System mode, the
+default custom palette and 100% widget size. **Done**, Escape or the close button
+closes the studio without quitting the monitor. Controls support Tab and Space,
+and the slider also takes the arrow keys and PageUp/PageDown. High-usage warning
 gauges retain their amber/red semantic colors. Customization applies to the
 widget, not the Windows shell's notification-area icon badges.
 
-The widget is 62 logical pixels tall to fit Claude's Fable row and scales with monitor DPI. Provider
-names make identity independent of colour, and the used/reset header explains
-the figures. Each provider takes 174 logical pixels, with an 8-pixel gap. Dark
-and light system themes are supported. Animation runs at 10 Hz, RAM sampling at
-2 seconds; neither causes additional network polls.
+At the default 100% widget size, the widget is 62 logical pixels tall to fit
+Claude's Fable row, and each provider takes 174 logical pixels with an 8-pixel
+gap. The **Widget size** slider scales all of that from 75% to 200%, on top of
+monitor DPI scaling. Provider names make identity independent of colour, and
+the used/reset header explains the figures. Dark and light system themes are
+supported. Animation runs at 10 Hz, RAM sampling at 2 seconds; neither causes
+additional network polls.
 
 The widget floats above normal application windows. **Drag anywhere on it** to
 move it in any direction, including between monitors. It remembers the dropped
