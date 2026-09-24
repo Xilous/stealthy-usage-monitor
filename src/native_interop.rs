@@ -1,5 +1,8 @@
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
+use windows::Win32::Graphics::Gdi::{
+    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
+};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Shell::{SHAppBarMessage, ABM_GETTASKBARPOS, APPBARDATA};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -79,6 +82,37 @@ pub fn find_taskbars() -> Vec<TaskbarWindow> {
         )
     });
     taskbars
+}
+
+/// Work areas (taskbar excluded) of every attached display, in screen coordinates.
+pub fn monitor_work_areas() -> Vec<RECT> {
+    unsafe extern "system" fn enum_proc(
+        monitor: HMONITOR,
+        _hdc: HDC,
+        _rect: *mut RECT,
+        lparam: LPARAM,
+    ) -> BOOL {
+        let areas = &mut *(lparam.0 as *mut Vec<RECT>);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+            areas.push(info.rcWork);
+        }
+        BOOL(1)
+    }
+
+    let mut areas: Vec<RECT> = Vec::new();
+    unsafe {
+        let _ = EnumDisplayMonitors(
+            HDC::default(),
+            None,
+            Some(enum_proc),
+            LPARAM(&mut areas as *mut _ as isize),
+        );
+    }
+    areas
 }
 
 /// Find a child window by class name
