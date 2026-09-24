@@ -2465,23 +2465,7 @@ fn paint_content(
                 widget_sc(4),
             );
             fill_box(hdc, x + widget_sc(6), widget_sc(5), widget_sc(3), widget_sc(3), &ident_color);
-            SelectObject(hdc, day_font_bold);
-            draw_text_in(
-                hdc,
-                RECT {
-                    left: x + widget_sc(13),
-                    top: widget_sc(1),
-                    right: x + widget_sc(83),
-                    bottom: widget_sc(12),
-                },
-                match idx {
-                    0 => "CLAUDE",
-                    2 => "CODEX",
-                    _ => "ANTIGRAVITY",
-                },
-                &ident_color,
-                DT_LEFT | DT_VCENTER | DT_SINGLELINE,
-            );
+            // No provider name: the card's accent color identifies the provider.
             SelectObject(hdc, day_font);
             draw_text_in(
                 hdc,
@@ -3057,6 +3041,58 @@ fn clamp_desktop_position(x: i32, y: i32, width: i32, height: i32, work: RECT) -
     )
 }
 
+/// Whether the pixel at (px, py) lies in some work area. A work area covers
+/// left..right and top..bottom as half-open ranges, as Win32 RECTs do.
+fn point_on_screen(px: i32, py: i32, works: &[RECT]) -> bool {
+    works
+        .iter()
+        .any(|w| px >= w.left && px < w.right && py >= w.top && py < w.bottom)
+}
+
+/// Whether all four corner pixels of the rect are each inside some work area.
+/// The corners are the rect's outermost pixels, (x, y) to (x + w - 1, y + h - 1),
+/// so a widget sitting flush against a right or bottom edge still counts.
+fn corners_on_screen(x: i32, y: i32, width: i32, height: i32, works: &[RECT]) -> bool {
+    let right = x + width.max(1) - 1;
+    let bottom = y + height.max(1) - 1;
+    point_on_screen(x, y, works)
+        && point_on_screen(right, y, works)
+        && point_on_screen(x, bottom, works)
+        && point_on_screen(right, bottom, works)
+}
+
+/// Position closest to the proposed top-left at which every corner of the
+/// widget lies inside some monitor's work area. A proposal that already
+/// satisfies that is returned unchanged, so the widget may straddle monitors.
+fn keep_widget_on_screen(x: i32, y: i32, width: i32, height: i32, works: &[RECT]) -> (i32, i32) {
+    if works.is_empty() || corners_on_screen(x, y, width, height, works) {
+        return (x, y);
+    }
+    let distance = |(cx, cy): (i32, i32)| {
+        let dx = (cx - x) as i64;
+        let dy = (cy - y) as i64;
+        dx * dx + dy * dy
+    };
+    let mut best: Option<(i32, i32)> = None;
+    let mut fallback: Option<(i32, i32)> = None;
+    for work in works {
+        let inside = clamp_desktop_position(x, y, width, height, *work);
+        if fallback.map_or(true, |f| distance(inside) < distance(f)) {
+            fallback = Some(inside);
+        }
+        for candidate in [inside, (x, inside.1), (inside.0, y)] {
+            if corners_on_screen(candidate.0, candidate.1, width, height, works)
+                && best.map_or(true, |b| distance(candidate) < distance(b))
+            {
+                best = Some(candidate);
+            }
+        }
+    }
+    // Only a widget larger than every work area has no valid candidate; it is
+    // then top-left aligned in the nearest work area.
+    best.or(fallback).unwrap_or((x, y))
+}
+
 #[cfg(test)]
 mod desktop_tests {
     use super::*;
@@ -3094,6 +3130,58 @@ mod desktop_tests {
             clamp_desktop_position(0, 0, 2000, 1000, work),
             (-1280, -900)
         );
+    }
+
+    fn work(left: i32, top: i32, right: i32, bottom: i32) -> RECT {
+        RECT {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    #[test]
+    fn single_monitor_keeps_the_widget_inside_and_pulls_it_back_from_each_edge() {
+        let works = [work(0, 0, 1920, 1040)];
+        assert_eq!(keep_widget_on_screen(300, 200, 384, 46, &works), (300, 200));
+        assert_eq!(keep_widget_on_screen(1536, 994, 384, 46, &works), (1536, 994));
+        assert_eq!(keep_widget_on_screen(-50, 200, 384, 46, &works), (0, 200));
+        assert_eq!(keep_widget_on_screen(1700, 200, 384, 46, &works), (1536, 200));
+        assert_eq!(keep_widget_on_screen(300, -20, 384, 46, &works), (300, 0));
+        assert_eq!(keep_widget_on_screen(300, 1020, 384, 46, &works), (300, 994));
+        assert_eq!(keep_widget_on_screen(-90, -90, 384, 46, &works), (0, 0));
+    }
+
+    #[test]
+    fn widget_may_straddle_side_by_side_monitors_but_not_leave_the_top() {
+        let works = [work(0, 0, 1920, 1040), work(1920, 0, 3840, 1040)];
+        assert_eq!(keep_widget_on_screen(1800, 300, 384, 46, &works), (1800, 300));
+        assert_eq!(keep_widget_on_screen(1800, -30, 384, 46, &works), (1800, 0));
+        assert_eq!(keep_widget_on_screen(1000, -10, 2500, 46, &works), (1000, 0));
+    }
+
+    #[test]
+    fn corners_in_the_gap_between_offset_monitors_are_moved_onto_a_screen() {
+        let works = [work(0, 0, 1920, 1040), work(1920, 200, 3840, 1240)];
+        let top = keep_widget_on_screen(1800, 100, 384, 46, &works);
+        assert!(corners_on_screen(top.0, top.1, 384, 46, &works));
+        assert_eq!(top, (1800, 200));
+        let bottom = keep_widget_on_screen(1800, 1020, 384, 46, &works);
+        assert!(corners_on_screen(bottom.0, bottom.1, 384, 46, &works));
+        assert_eq!(bottom, (1800, 994));
+    }
+
+    #[test]
+    fn widget_larger_than_every_monitor_is_top_left_aligned_in_the_nearest() {
+        let works = [work(0, 0, 1920, 1040), work(1920, 0, 3840, 1040)];
+        assert_eq!(keep_widget_on_screen(100, 100, 2500, 1200, &works), (0, 0));
+        assert_eq!(keep_widget_on_screen(3000, 500, 2500, 1200, &works), (1920, 0));
+    }
+
+    #[test]
+    fn no_monitors_leaves_the_proposal_alone() {
+        assert_eq!(keep_widget_on_screen(5000, 5000, 384, 46, &[]), (5000, 5000));
     }
 
     #[test]
@@ -3146,21 +3234,26 @@ fn position_floating_widget() {
         )
     };
     let height = widget_sc(WIDGET_HEIGHT);
-    let (x, y) = saved.unwrap_or((0, 0));
     unsafe {
-        let monitor = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
-        let mut info = MONITORINFO {
-            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-            ..Default::default()
+        let (x, y) = match saved {
+            Some(position) => position,
+            None => {
+                let monitor = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTONEAREST);
+                let mut info = MONITORINFO {
+                    cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                    ..Default::default()
+                };
+                if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+                    return;
+                }
+                (
+                    info.rcWork.right - width - dpi_sc(16),
+                    info.rcWork.top + dpi_sc(16),
+                )
+            }
         };
-        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
-            return;
-        }
-        let (x, y) = saved.unwrap_or((
-            info.rcWork.right - width - dpi_sc(16),
-            info.rcWork.top + dpi_sc(16),
-        ));
-        let position = clamp_desktop_position(x, y, width, height, info.rcWork);
+        let works = native_interop::monitor_work_areas();
+        let position = keep_widget_on_screen(x, y, width, height, &works);
         let changed = {
             let mut state = lock_state();
             let Some(s) = state.as_mut() else {
@@ -3475,6 +3568,26 @@ unsafe extern "system" fn wnd_proc(
                 s.dragging = true;
             }
             LRESULT(0)
+        }
+        WM_MOVING => {
+            let floating = lock_state().as_ref().map(|s| !s.embedded).unwrap_or(false);
+            if !floating || lparam.0 == 0 {
+                return DefWindowProcW(hwnd, msg, wparam, lparam);
+            }
+            // Correct the proposed rect on every mouse move so no corner of the
+            // widget can be dragged off the usable area of every display.
+            let rect = &mut *(lparam.0 as *mut RECT);
+            let width = rect.right - rect.left;
+            let height = rect.bottom - rect.top;
+            let works = native_interop::monitor_work_areas();
+            let (x, y) = keep_widget_on_screen(rect.left, rect.top, width, height, &works);
+            *rect = RECT {
+                left: x,
+                top: y,
+                right: x + width,
+                bottom: y + height,
+            };
+            LRESULT(1)
         }
         WM_EXITSIZEMOVE => {
             let rect = native_interop::get_window_rect_safe(hwnd);

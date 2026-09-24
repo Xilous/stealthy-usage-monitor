@@ -1,7 +1,7 @@
 # Stealthy Usage Monitor
 
 A small native Windows desktop widget for Claude, Codex and Antigravity usage.
-This fork's compact cards show provider names, quota-window labels, **percentage
+This fork's compact cards show quota-window labels, **percentage
 used**, reset countdowns and warning-coloured gauges. There is no browser runtime.
 
 ## Claude Fable
@@ -76,17 +76,19 @@ widget, not the Windows shell's notification-area icon badges.
 At the default 100% widget size, the widget is 62 logical pixels tall to fit
 Claude's Fable row, and each provider takes 174 logical pixels with an 8-pixel
 gap. The **Widget size** slider scales all of that from 75% to 200%, on top of
-monitor DPI scaling. Provider names make identity independent of colour, and
+monitor DPI scaling. Each provider is identified by its accent colour (set in the appearance studio), and
 the used/reset header explains the figures. Dark and light system themes are
 supported. Animation runs at 10 Hz, RAM sampling at 2 seconds; neither causes
 additional network polls.
 
 The widget floats above normal application windows. **Drag anywhere on it** to
-move it in any direction, including between monitors. It remembers the dropped
-position across restarts; taskbar/tray updates no longer move it back to the
-bottom of the screen. On a fresh start it appears near the top-right of the
-primary display. Removed monitors or a changed display layout bring it back
-inside the nearest monitor's work area.
+move it in any direction, including between monitors. It always stays fully on
+screen: it can't be dragged off an edge, and it can span two monitors as long as
+every corner is on one of them (the taskbar area doesn't count). It remembers
+the dropped position across restarts; taskbar/tray updates no longer move it
+back to the bottom of the screen. On a fresh start it appears near the
+top-right of the primary display. Removed monitors, a changed display layout,
+or a larger widget size bring it back fully on screen at the nearest spot.
 
 Right-click the widget or its tray icon for providers, refresh, visibility, and
 **Reset Position** (returns it to the top-right). Old taskbar/click-through
