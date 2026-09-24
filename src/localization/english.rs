@@ -1,8 +1,8 @@
 use super::Strings;
 
-pub(super) const UPDATE_VIA_WINGET_LABEL: &str = "Update via WinGet";
+pub const UPDATE_VIA_WINGET_LABEL: &str = "Update via WinGet";
 
-pub(super) const STRINGS: Strings = Strings {
+pub const STRINGS: Strings = Strings {
     window_title: "Stealthy Usage Monitor",
     refresh: "Refresh",
     update_frequency: "Update Frequency",
@@ -17,8 +17,6 @@ pub(super) const STRINGS: Strings = Strings {
     settings: "Settings",
     start_with_windows: "Start with Windows",
     reset_position: "Reset Position",
-    language: "Language",
-    system_default: "System Default",
     check_for_updates: "Check for Updates",
     checking_for_updates: "Checking for Updates...",
     updates: "Updates",

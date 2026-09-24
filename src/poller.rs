@@ -1725,7 +1725,7 @@ mod tests {
             format_reset(
                 &usage.weekly,
                 WindowKind::Weekly,
-                LanguageId::English.strings()
+                STRINGS
             ),
             "n/a"
         );
@@ -1764,11 +1764,11 @@ mod tests {
         assert_eq!(usage.session.percentage, 25.0);
         assert_eq!(usage.weekly.percentage, 60.0);
     }
-    use crate::localization::LanguageId;
+    use crate::localization::STRINGS;
 
     #[test]
     fn session_countdown_always_shows_hours_and_minutes() {
-        let strings = LanguageId::English.strings();
+        let strings = STRINGS;
         let fmt = |secs| format_countdown_from_secs(secs, WindowKind::Session, strings);
 
         assert_eq!(fmt(4 * 3600 + 59 * 60 + 59), "4h 59m");
@@ -1779,7 +1779,7 @@ mod tests {
 
     #[test]
     fn weekly_countdown_always_shows_days_and_hours() {
-        let strings = LanguageId::English.strings();
+        let strings = STRINGS;
         let fmt = |secs| format_countdown_from_secs(secs, WindowKind::Weekly, strings);
 
         // 1 day 22 hours must not collapse to "1d"

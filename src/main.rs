@@ -25,12 +25,12 @@ fn main() {
                         poller::format_line(
                             &usage.session,
                             poller::WindowKind::Session,
-                            localization::LanguageId::English.strings()
+                            localization::STRINGS
                         ),
                         poller::format_line(
                             &usage.weekly,
                             poller::WindowKind::Weekly,
-                            localization::LanguageId::English.strings()
+                            localization::STRINGS
                         )
                     );
                 }

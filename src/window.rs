@@ -21,7 +21,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::appearance::{Appearance, Mode};
 use crate::diagnose;
-use crate::localization::{self, LanguageId, Strings};
+use crate::localization::{self, Strings};
 use crate::models::{AppUsageData, UsageData};
 use crate::native_interop::{
     self, Color, TIMER_ANIM, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RAM, TIMER_RESET_POLL,
@@ -58,8 +58,6 @@ struct AppState {
     is_dark: bool,
     appearance: Appearance,
     embedded: bool,
-    language_override: Option<LanguageId>,
-    language: LanguageId,
     install_channel: InstallChannel,
 
     session_percent: f64,
@@ -127,18 +125,6 @@ const IDM_FREQ_1HOUR: u16 = 13;
 const IDM_START_WITH_WINDOWS: u16 = 20;
 const IDM_RESET_POSITION: u16 = 30;
 const IDM_VERSION_ACTION: u16 = 31;
-const IDM_LANG_SYSTEM: u16 = 40;
-const IDM_LANG_ENGLISH: u16 = 41;
-const IDM_LANG_DUTCH: u16 = 42;
-const IDM_LANG_SPANISH: u16 = 43;
-const IDM_LANG_FRENCH: u16 = 44;
-const IDM_LANG_GERMAN: u16 = 45;
-const IDM_LANG_JAPANESE: u16 = 46;
-const IDM_LANG_KOREAN: u16 = 47;
-const IDM_LANG_TRADITIONAL_CHINESE: u16 = 48;
-const IDM_LANG_RUSSIAN: u16 = 49;
-const IDM_LANG_PORTUGUESE_BRAZIL: u16 = 50;
-const IDM_LANG_SIMPLIFIED_CHINESE: u16 = 51;
 const IDM_MODEL_CLAUDE_CODE: u16 = 60;
 const IDM_MODEL_CODEX: u16 = 61;
 const IDM_MODEL_ANTIGRAVITY: u16 = 62;
@@ -324,8 +310,6 @@ struct SettingsFile {
     #[serde(default = "default_poll_interval")]
     poll_interval_ms: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    language: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     last_update_check_unix: Option<u64>,
     #[serde(default = "default_widget_visible")]
     widget_visible: bool,
@@ -366,7 +350,6 @@ impl Default for SettingsFile {
             tray_offset: 0,
             taskbar_index: 0,
             poll_interval_ms: default_poll_interval(),
-            language: None,
             last_update_check_unix: None,
             widget_visible: true,
             show_claude_code: true,
@@ -448,9 +431,6 @@ fn save_state_settings() {
             tray_offset: s.tray_offset,
             taskbar_index: s.taskbar_index,
             poll_interval_ms: s.poll_interval_ms,
-            language: s
-                .language_override
-                .map(|language| language.code().to_string()),
             last_update_check_unix: s.last_update_check_unix,
             widget_visible: s.widget_visible,
             show_claude_code: s.show_claude_code,
@@ -471,7 +451,7 @@ fn fable_readout_from_state(s: &AppState) -> (f64, String) {
             let reset = poller::format_reset(
                 &usage.fable,
                 poller::WindowKind::Weekly,
-                s.language.strings(),
+                localization::STRINGS,
             );
             (
                 usage.fable.percentage,
@@ -500,7 +480,7 @@ fn tray_icon_data_from_state() -> Vec<tray_icon::TrayIconData> {
                     percent: readout::has_reading(&s.session_text).then_some(s.session_percent),
                     tooltip: format!(
                         "{} 5h: {} | 7d: {} | Fable: {}",
-                        s.language.strings().claude_code_model,
+                        localization::STRINGS.claude_code_model,
                         readout::tooltip_row(s.session_percent, &s.session_text),
                         readout::tooltip_row(s.weekly_percent, &s.weekly_text),
                         {
@@ -517,7 +497,7 @@ fn tray_icon_data_from_state() -> Vec<tray_icon::TrayIconData> {
                         .then_some(s.codex_weekly_percent),
                     tooltip: format!(
                         "{} 7d: {}",
-                        s.language.strings().codex_model,
+                        localization::STRINGS.codex_model,
                         readout::tooltip_row(s.codex_weekly_percent, &s.codex_weekly_text)
                     ),
                 });
@@ -529,7 +509,7 @@ fn tray_icon_data_from_state() -> Vec<tray_icon::TrayIconData> {
                         .then_some(s.antigravity_session_percent),
                     tooltip: format!(
                         "{} Quota: {} | Extra: {}",
-                        s.language.strings().antigravity_model,
+                        localization::STRINGS.antigravity_model,
                         readout::tooltip_row(
                             s.antigravity_session_percent,
                             &s.antigravity_session_text
@@ -549,21 +529,21 @@ fn tray_icon_data_from_state() -> Vec<tray_icon::TrayIconData> {
                 icons.push(tray_icon::TrayIconData {
                     kind: tray_icon::TrayIconKind::Claude,
                     percent: None,
-                    tooltip: s.language.strings().window_title.to_string(),
+                    tooltip: localization::STRINGS.window_title.to_string(),
                 });
             }
             if s.show_codex {
                 icons.push(tray_icon::TrayIconData {
                     kind: tray_icon::TrayIconKind::Codex,
                     percent: None,
-                    tooltip: s.language.strings().codex_window_title.to_string(),
+                    tooltip: localization::STRINGS.codex_window_title.to_string(),
                 });
             }
             if s.show_antigravity {
                 icons.push(tray_icon::TrayIconData {
                     kind: tray_icon::TrayIconKind::Antigravity,
                     percent: None,
-                    tooltip: s.language.strings().antigravity_window_title.to_string(),
+                    tooltip: localization::STRINGS.antigravity_window_title.to_string(),
                 });
             }
             icons
@@ -768,7 +748,7 @@ fn refresh_usage_texts(state: &mut AppState) {
         return;
     }
 
-    let strings = state.language.strings();
+    let strings = localization::STRINGS;
     let Some(data) = state.data.as_ref() else {
         return;
     };
@@ -827,13 +807,6 @@ fn refresh_usage_texts(state: &mut AppState) {
     }
 }
 
-fn set_window_title(hwnd: HWND, strings: Strings) {
-    unsafe {
-        let title = native_interop::wide_str(strings.window_title);
-        let _ = SetWindowTextW(hwnd, PCWSTR::from_raw(title.as_ptr()));
-    }
-}
-
 fn show_info_message(hwnd: HWND, title: &str, message: &str) {
     unsafe {
         let title_wide = native_interop::wide_str(title);
@@ -877,35 +850,8 @@ fn show_update_prompt(hwnd: HWND, strings: Strings, release: &ReleaseDescriptor)
     }
 }
 
-fn apply_language_to_state(state: &mut AppState, language_override: Option<LanguageId>) {
-    state.language_override = language_override;
-    state.language = localization::resolve_language(language_override);
-    set_window_title(state.hwnd.to_hwnd(), state.language.strings());
-    refresh_usage_texts(state);
-}
-
-fn update_language_change() -> bool {
-    let mut state = lock_state();
-    let Some(app_state) = state.as_mut() else {
-        return false;
-    };
-
-    if app_state.language_override.is_some() {
-        return false;
-    }
-
-    let new_language = localization::detect_system_language();
-    if new_language == app_state.language {
-        return false;
-    }
-
-    apply_language_to_state(app_state, None);
-    true
-}
-
 fn version_action_label(
     strings: Strings,
-    language: LanguageId,
     install_channel: InstallChannel,
     status: &UpdateStatus,
 ) -> String {
@@ -924,7 +870,7 @@ fn version_action_label(
             }
             InstallChannel::Winget => format!(
                 "v{current} - {} v{}",
-                localization::update_via_winget(language),
+                localization::UPDATE_VIA_WINGET_LABEL,
                 release.latest_version
             ),
         },
@@ -946,15 +892,15 @@ fn begin_update_check(hwnd: HWND, interactive: bool) {
             if interactive {
                 show_info_message(
                     hwnd,
-                    app_state.language.strings().updates,
-                    app_state.language.strings().update_in_progress,
+                    localization::STRINGS.updates,
+                    localization::STRINGS.update_in_progress,
                 );
             }
             return;
         }
 
         app_state.update_status = UpdateStatus::Checking;
-        (app_state.language.strings(), app_state.install_channel)
+        (localization::STRINGS, app_state.install_channel)
     };
 
     std::thread::spawn(move || {
@@ -1032,14 +978,14 @@ fn begin_update_apply(hwnd: HWND, release: ReleaseDescriptor) {
         ) {
             show_info_message(
                 hwnd,
-                app_state.language.strings().updates,
-                app_state.language.strings().update_in_progress,
+                localization::STRINGS.updates,
+                localization::STRINGS.update_in_progress,
             );
             return;
         }
 
         app_state.update_status = UpdateStatus::Applying;
-        app_state.language.strings()
+        localization::STRINGS
     };
 
     std::thread::spawn(move || {
@@ -1067,11 +1013,7 @@ fn begin_update_apply(hwnd: HWND, release: ReleaseDescriptor) {
 }
 
 fn begin_winget_update(hwnd: HWND) {
-    let strings = {
-        let state = lock_state();
-        state.as_ref().map(|s| s.language.strings())
-    }
-    .unwrap_or(LanguageId::English.strings());
+    let strings = localization::STRINGS;
 
     match updater::begin_winget_update() {
         Ok(()) => unsafe {
@@ -1843,12 +1785,10 @@ pub fn run() {
             settings.show_codex = true;
             settings.show_antigravity = false;
         }
-        let language_override = settings.language.as_deref().and_then(LanguageId::from_code);
-        let language = localization::resolve_language(language_override);
         let install_channel = updater::current_install_channel();
 
         // Create as layered popup (will be reparented into taskbar)
-        let title = native_interop::wide_str(language.strings().window_title);
+        let title = native_interop::wide_str(localization::STRINGS.window_title);
         let initial_model_count = active_model_count(
             settings.show_claude_code,
             settings.show_codex,
@@ -1911,8 +1851,6 @@ pub fn run() {
                 foreground_hook: None,
                 is_dark,
                 embedded: false,
-                language_override,
-                language,
                 install_channel,
                 session_percent: 0.0,
                 session_text: "--".to_string(),
@@ -2126,7 +2064,7 @@ fn render_layered() {
                     s.hwnd,
                     s.is_dark,
                     s.embedded,
-                    s.language.strings(),
+                    localization::STRINGS,
                     s.session_percent,
                     session_pace,
                     weekly_pace,
@@ -2770,24 +2708,24 @@ fn do_poll(send_hwnd: SendHwnd) {
                     state.as_ref().map(|s| {
                         if s.show_claude_code {
                             (
-                                s.language.strings(),
+                                localization::STRINGS,
                                 tray_icon::TrayIconKind::Claude,
-                                s.language.strings().token_expired_title,
-                                s.language.strings().token_expired_body,
+                                localization::STRINGS.token_expired_title,
+                                localization::STRINGS.token_expired_body,
                             )
                         } else if s.show_codex {
                             (
-                                s.language.strings(),
+                                localization::STRINGS,
                                 tray_icon::TrayIconKind::Codex,
-                                s.language.strings().codex_token_expired_title,
-                                s.language.strings().codex_token_expired_body,
+                                localization::STRINGS.codex_token_expired_title,
+                                localization::STRINGS.codex_token_expired_body,
                             )
                         } else {
                             (
-                                s.language.strings(),
+                                localization::STRINGS,
                                 tray_icon::TrayIconKind::Antigravity,
-                                s.language.strings().antigravity_token_expired_title,
-                                s.language.strings().antigravity_token_expired_body,
+                                localization::STRINGS.antigravity_token_expired_title,
+                                localization::STRINGS.antigravity_token_expired_body,
                             )
                         }
                     })
@@ -2910,12 +2848,6 @@ pub(crate) fn set_appearance(value: Appearance) {
     }
     save_state_settings();
     render_layered();
-}
-
-fn check_language_change() {
-    if update_language_change() {
-        render_layered();
-    }
 }
 
 fn update_display() {
@@ -3110,6 +3042,15 @@ mod desktop_tests {
         assert_eq!(restored.floating_position, Some((-800, 240)));
         assert_eq!(restored.desktop_layout_version, 1);
     }
+
+    #[test]
+    fn old_settings_with_a_language_key_still_load_and_drop_it_on_save() {
+        let settings: SettingsFile = serde_json::from_str(r#"{"poll_interval_ms":60000,"language":"de","show_codex":false}"#).unwrap();
+        assert_eq!(settings.poll_interval_ms, 60000);
+        assert!(!settings.show_codex);
+        let saved = serde_json::to_string(&settings).unwrap();
+        assert!(!saved.contains("language"));
+    }
 }
 
 /// Desktop position is independent of taskbar events and tray icon movement.
@@ -3273,7 +3214,6 @@ unsafe extern "system" fn wnd_proc(
             }
             if msg == WM_SETTINGCHANGE {
                 check_theme_change();
-                check_language_change();
             }
             refresh_dpi();
             position_at_taskbar();
@@ -3418,7 +3358,6 @@ unsafe extern "system" fn wnd_proc(
                 mark_poll();
             }
             check_theme_change();
-            check_language_change();
             render_layered();
             schedule_countdown_timer();
             suppress_tray_reposition_for(Duration::from_millis(
@@ -3801,42 +3740,6 @@ unsafe extern "system" fn wnd_proc(
                         do_poll(sh);
                     });
                 }
-                IDM_LANG_SYSTEM
-                | IDM_LANG_ENGLISH
-                | IDM_LANG_DUTCH
-                | IDM_LANG_SPANISH
-                | IDM_LANG_FRENCH
-                | IDM_LANG_GERMAN
-                | IDM_LANG_JAPANESE
-                | IDM_LANG_KOREAN
-                | IDM_LANG_TRADITIONAL_CHINESE
-                | IDM_LANG_SIMPLIFIED_CHINESE
-                | IDM_LANG_RUSSIAN
-                | IDM_LANG_PORTUGUESE_BRAZIL => {
-                    let language_override = match id {
-                        IDM_LANG_SYSTEM => None,
-                        IDM_LANG_ENGLISH => Some(LanguageId::English),
-                        IDM_LANG_DUTCH => Some(LanguageId::Dutch),
-                        IDM_LANG_SPANISH => Some(LanguageId::Spanish),
-                        IDM_LANG_FRENCH => Some(LanguageId::French),
-                        IDM_LANG_GERMAN => Some(LanguageId::German),
-                        IDM_LANG_JAPANESE => Some(LanguageId::Japanese),
-                        IDM_LANG_KOREAN => Some(LanguageId::Korean),
-                        IDM_LANG_TRADITIONAL_CHINESE => Some(LanguageId::TraditionalChinese),
-                        IDM_LANG_SIMPLIFIED_CHINESE => Some(LanguageId::SimplifiedChinese),
-                        IDM_LANG_RUSSIAN => Some(LanguageId::Russian),
-                        IDM_LANG_PORTUGUESE_BRAZIL => Some(LanguageId::PortugueseBrazil),
-                        _ => None,
-                    };
-                    {
-                        let mut state = lock_state();
-                        if let Some(s) = state.as_mut() {
-                            apply_language_to_state(s, language_override);
-                        }
-                    }
-                    save_state_settings();
-                    render_layered();
-                }
                 id if id == tray_icon::IDM_TOGGLE_WIDGET => {
                     toggle_widget_visibility(hwnd);
                 }
@@ -3882,11 +3785,9 @@ unsafe extern "system" fn wnd_proc(
 
 fn show_context_menu(hwnd: HWND) {
     unsafe {
+        let strings = localization::STRINGS;
         let (
             current_interval,
-            strings,
-            language,
-            language_override,
             install_channel,
             update_status,
             widget_visible,
@@ -3898,9 +3799,6 @@ fn show_context_menu(hwnd: HWND) {
             match state.as_ref() {
                 Some(s) => (
                     s.poll_interval_ms,
-                    s.language.strings(),
-                    s.language,
-                    s.language_override,
                     s.install_channel,
                     s.update_status.clone(),
                     s.widget_visible,
@@ -3910,9 +3808,6 @@ fn show_context_menu(hwnd: HWND) {
                 ),
                 None => (
                     POLL_15_MIN,
-                    LanguageId::English.strings(),
-                    LanguageId::English,
-                    None,
                     InstallChannel::Portable,
                     UpdateStatus::Idle,
                     true,
@@ -4045,60 +3940,9 @@ fn show_context_menu(hwnd: HWND) {
             PCWSTR::from_raw(reset_pos_str.as_ptr()),
         );
 
-        let language_menu = CreatePopupMenu().unwrap();
-        let system_label = native_interop::wide_str(strings.system_default);
-        let system_flags = if language_override.is_none() {
-            MF_CHECKED
-        } else {
-            MENU_ITEM_FLAGS(0)
-        };
-        let _ = AppendMenuW(
-            language_menu,
-            system_flags,
-            IDM_LANG_SYSTEM as usize,
-            PCWSTR::from_raw(system_label.as_ptr()),
-        );
-
-        for language in LanguageId::ALL {
-            let id = match language {
-                LanguageId::English => IDM_LANG_ENGLISH,
-                LanguageId::Dutch => IDM_LANG_DUTCH,
-                LanguageId::Spanish => IDM_LANG_SPANISH,
-                LanguageId::French => IDM_LANG_FRENCH,
-                LanguageId::German => IDM_LANG_GERMAN,
-                LanguageId::Japanese => IDM_LANG_JAPANESE,
-                LanguageId::Korean => IDM_LANG_KOREAN,
-                LanguageId::TraditionalChinese => IDM_LANG_TRADITIONAL_CHINESE,
-                LanguageId::SimplifiedChinese => IDM_LANG_SIMPLIFIED_CHINESE,
-                LanguageId::Russian => IDM_LANG_RUSSIAN,
-                LanguageId::PortugueseBrazil => IDM_LANG_PORTUGUESE_BRAZIL,
-            };
-            let label_str = native_interop::wide_str(language.native_name());
-            let flags = if language_override == Some(language) {
-                MF_CHECKED
-            } else {
-                MENU_ITEM_FLAGS(0)
-            };
-            let _ = AppendMenuW(
-                language_menu,
-                flags,
-                id as usize,
-                PCWSTR::from_raw(label_str.as_ptr()),
-            );
-        }
-
-        let language_label = native_interop::wide_str(strings.language);
-        let _ = AppendMenuW(
-            settings_menu,
-            MF_POPUP,
-            language_menu.0 as usize,
-            PCWSTR::from_raw(language_label.as_ptr()),
-        );
-
         let _ = AppendMenuW(settings_menu, MF_SEPARATOR, 0, PCWSTR::null());
 
-        let version_label =
-            version_action_label(strings, language, install_channel, &update_status);
+        let version_label = version_action_label(strings, install_channel, &update_status);
         let version_str = native_interop::wide_str(&version_label);
         let version_flags = if matches!(
             update_status,
@@ -4184,7 +4028,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 let (session_pace, weekly_pace) = claude_pace_markers(s.data.as_ref());
                 (
                     s.is_dark,
-                    s.language.strings(),
+                    localization::STRINGS,
                     s.session_percent,
                     session_pace,
                     weekly_pace,
@@ -4642,7 +4486,7 @@ pub fn write_preview(path: &str, dark: bool, unavailable: bool) -> std::io::Resu
             &ink,
             &claude_accent_color(),
             &track,
-            LanguageId::English.strings(),
+            localization::STRINGS,
             week_markers(None),
             32.0,
             Some(45.0),
