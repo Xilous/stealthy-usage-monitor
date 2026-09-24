@@ -2837,16 +2837,24 @@ pub(crate) fn appearance() -> Appearance {
         .unwrap_or_default()
 }
 
-pub(crate) fn set_appearance(value: Appearance) {
+fn store_appearance(value: Appearance) {
     let dark = value.is_dark(theme::is_dark_mode());
-    {
-        let mut state = lock_state();
-        if let Some(s) = state.as_mut() {
-            s.appearance = value;
-            s.is_dark = dark;
-        }
+    let mut state = lock_state();
+    if let Some(s) = state.as_mut() {
+        s.appearance = value;
+        s.is_dark = dark;
     }
+}
+
+pub(crate) fn set_appearance(value: Appearance) {
+    store_appearance(value);
     save_state_settings();
+    render_layered();
+}
+
+/// Applies an appearance in memory and on screen without writing the settings file.
+pub(crate) fn preview_appearance(value: Appearance) {
+    store_appearance(value);
     render_layered();
 }
 
